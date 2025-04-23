@@ -1,5 +1,4 @@
 import cmd
-from server import TCPServer
 import shlex
 import argparse
 import threading
@@ -7,393 +6,847 @@ import socket
 import sys
 import time
 import atexit
+import os
+import logging
+import ssl # Import needed for potential SSLError
+from time import sleep
+
+# --- Basic Logging Setup ---
+logging.basicConfig(level=logging.INFO,
+                    format='%(asctime)s - %(threadName)s - %(levelname)s - %(message)s',
+                    handlers=[logging.FileHandler("commandshell.log"),
+                              logging.StreamHandler(sys.stdout)])
+
+# --- Import the FIXED TCPServer ---
+# Ensure 'server.py' contains the corrected TCPServer code provided previously
+try:
+    from server import TCPServer
+except ImportError:
+    logging.critical("Failed to import TCPServer from server.py. Please ensure it exists and is correct.")
+    # Provide a dummy class to prevent NameError if import fails
+    class TCPServer:
+        def __init__(self, *args, **kwargs): logging.error("TCPServer Dummy Loaded"); pass
+        def start(self, *args): pass # Dummy needs to accept event arg
+        def stop(self): pass
+        def get_clients(self): return {}
+        def disconnect_client(self, *args): return False
+        def send_file(self, *args): return False
 
 
 def intro():
+    # (Keep your cool ASCII art intro)
     print("""
 
-█████   ██████ ███████     ██       ██████   ██████ ██   ██ 
-██   ██ ██      ██          ██      ██    ██ ██      ██  ██  
-███████ ██      █████       ██      ██    ██ ██      █████   
-██   ██ ██      ██          ██      ██    ██ ██      ██  ██  
-██   ██  ██████ ███████     ███████  ██████   ██████ ██   ██ 
+█████   ██████ ███████     ██       ██████   ██████ ██   ██
+██   ██ ██      ██          ██      ██    ██ ██      ██  ██
+███████ ██      █████       ██      ██    ██ ██      █████
+██   ██ ██      ██          ██      ██    ██ ██      ██  ██
+██   ██  ██████ ███████     ███████  ██████   ██████ ██   ██
 
 
     """)
-
+    logging.info("AceLock Command Shell Initialized")
 
 class CommandShell(cmd.Cmd):
-    def __init__(self):
+    def __init__(self, certfile='../ssl_deets/server.crt', keyfile='../ssl_deets/server.key'):
         super().__init__()
         self.intro = intro()
         self.prompt = 'AceLock> '
         self.server_object = None
-        self.current_client = None
+        # Store selected client info
+        self.current_client_socket = None
+        self.current_client_address = None
         self.server_thread = None
         self.server_running = False
-        self._lock = threading.Lock()
+        self._lock = threading.Lock() # Lock for server_running state
+        # Event for server startup synchronization <<-- Added
+        self.server_started_event = threading.Event()
+        # Store cert/key paths
+        self.certfile = certfile
+        self.keyfile = keyfile
 
-        # Register cleanup function to ensure proper shutdown
         atexit.register(self.cleanup)
 
     def cleanup(self):
-        """Ensure server is properly stopped when program exits"""
-        if self.server_running and self.server_object:
-            try:
-                print("[*] Cleaning up server resources...")
-                self.server_object.stop()
-
-                # Don't join the thread here learned that the hard way
-                with self._lock:
-                    self.server_running = False
-            except:
-                pass
+        """Ensure server is properly stopped when program exits."""
+        if self.server_running: # Quick check
+            with self._lock: # Check again under lock
+                if self.server_running and self.server_object:
+                    logging.info("Performing cleanup via atexit...")
+                    try:
+                        self.server_object.stop() # Use server's graceful stop
+                        self.server_running = False
+                        logging.info("Server stop requested during cleanup.")
+                    except Exception as e:
+                        logging.error(f"Error during server stop in cleanup: {e}", exc_info=True)
 
     def do_start_server(self, args):
         """
-        Start the TCP server with specified host and port
-        Usage: start_server [-host HOST] [-port PORT]
+        Start the secure TCP server with specified host, port, and certs.
+        Usage: start_server [-host HOST] [-port PORT] [-cert CERTFILE] [-key KEYFILE]
         """
-        if self.server_running:
-            print("[!] Server is already running")
-            return
+        with self._lock:
+            if self.server_running:
+                logging.warning("Start command issued, but server is already running.")
+                print("[!] Server is already running")
+                return
 
-        parser = argparse.ArgumentParser(description='Start the server')
+        parser = argparse.ArgumentParser(description='Start the secure server')
         parser.add_argument('-host', default='0.0.0.0', help='Server host address')
         parser.add_argument('-port', type=int, default=8000, help='Server port number')
+        # Use instance variables as defaults for cert/key <<-- Changed
+        parser.add_argument('-cert', default=self.certfile, help='Path to SSL certificate file')
+        parser.add_argument('-key', default=self.keyfile, help='Path to SSL key file')
 
         try:
             parsed_args = parser.parse_args(shlex.split(args))
-            self.server_object = TCPServer(parsed_args.host, parsed_args.port)
 
-            # Create and start the server thread
+            # Validate cert/key paths
+            if not os.path.isfile(parsed_args.cert):
+                logging.error(f"Certificate file not found: {parsed_args.cert}")
+                print(f"[!] Certificate file not found: {parsed_args.cert}")
+                return
+            if not os.path.isfile(parsed_args.key):
+                logging.error(f"Key file not found: {parsed_args.key}")
+                print(f"[!] Key file not found: {parsed_args.key}")
+                return
+
+            # Pass cert/key to constructor <<-- Changed
+            self.server_object = TCPServer(host=parsed_args.host, port=parsed_args.port,
+                                           certfile=parsed_args.cert, keyfile=parsed_args.key)
+            logging.info("TCPServer object created.")
+
+            # Reset event before starting <<-- Changed
+            self.server_started_event.clear()
+
+            # Create and start the server thread, passing the event <<-- Changed
             self.server_thread = threading.Thread(
                 target=self._run_server,
-                name="ServerThread"
+                name="ServerThread",
+                daemon=True
             )
-            self.server_thread.daemon = True  # IMPORTANT: Make thread exit when main program exits
 
             with self._lock:
-                self.server_running = True
+                self.server_running = True # Assume it will run unless error occurs
 
             self.server_thread.start()
-            time.sleep(0.5)
+            logging.info("Server thread started, waiting for startup confirmation...")
 
-            if self.server_running:
-                print(f"[+] Server started on {parsed_args.host}:{parsed_args.port}")
+            # Wait for the server thread to signal startup (with a timeout) <<-- Changed
+            if self.server_started_event.wait(timeout=10.0): # Wait up to 10 seconds
+                 with self._lock: # Re-check state after wait
+                     if self.server_running:
+                         logging.info(f"Server successfully started on {parsed_args.host}:{parsed_args.port}")
+                         print(f"[+] Secure Server started on {parsed_args.host}:{parsed_args.port}")
+                     else:
+                         # Server thread started but set server_running false before signalling (error)
+                         logging.error("Server thread started but reported an error during initialization.")
+                         print("[!] Server thread started but reported an error during initialization.")
             else:
-                print("[!] Failed to start server")
+                # Timeout occurred
+                logging.error("Server failed to start within timeout.")
+                print("[!] Server failed to start within timeout.")
+                with self._lock:
+                    self.server_running = False # Ensure state is correct
+                # Attempt cleanup if server object exists
+                if self.server_object:
+                    try: self.server_object.stop()
+                    except: pass
+
+        except (argparse.ArgumentError, ValueError) as e:
+            logging.error(f"Invalid arguments for start_server: {e}")
+            print(f"[!] Invalid arguments: {e}")
+        except ImportError as e:
+             logging.critical(f"Failed to import server components: {e}")
+             print(f"[!] Critical Error: Could not load server code: {e}")
+        except (ssl.SSLError, OSError, socket.error) as e:
+             logging.error(f"Failed to initialize server socket: {e}", exc_info=True)
+             print(f"[!] Error initializing server socket: {e}")
+             with self._lock: self.server_running = False
         except Exception as e:
+            logging.error(f"Error starting server: {e}", exc_info=True)
             print(f"[!] Error starting server: {e}")
             with self._lock:
                 self.server_running = False
+            self.server_object = None
 
     def _run_server(self):
-        """Thread target function to run the server and handle exceptions"""
+        """Thread target function to run the server's start method."""
         try:
-            self.server_object.start()
+            # Pass the event to the server's start method <<-- Changed
+            self.server_object.start(self.server_started_event)
+            logging.info("Server object's start() method returned (server likely stopped).")
         except Exception as e:
-            print(f"[!] Server error: {e}")
+            # Log errors occurring within the server's start method execution
+            logging.error(f"Error within server thread execution (server.start): {e}", exc_info=True)
+            # Ensure the startup event is set even on error so the main thread doesn't hang
+            self.server_started_event.set()
+            print(f"\n[!] Server Error: {e}")
         finally:
             with self._lock:
                 self.server_running = False
+            logging.info("Server thread finished.")
+            # Ensure event is set if loop terminates unexpectedly
+            if not self.server_started_event.is_set():
+                 self.server_started_event.set()
+            # Clear selection if server stops
+            self._clear_current_client() # Use helper
+            print("\n[*] Server has stopped. Client selection cleared.")
+
 
     def do_server_status(self, args):
         """
-        Display the current status of the server
+        Display the current status of the server.
         Usage: server_status
         """
-        if self.server_running:
-            print("[+] Server is running")
-            if self.server_object and hasattr(self.server_object, 'clients'):
-                print(f"[+] Connected clients: {len(self.server_object.clients)}")
+        with self._lock:
+            is_running = self.server_running
+
+        if is_running and self.server_object:
+            print("[+] Server Status: Running")
+            host = getattr(self.server_object, 'host', 'N/A')
+            port = getattr(self.server_object, 'port', 'N/A')
+            print(f"    Listening on: {host}:{port}")
+            try:
+                # Use the safe getter method <<-- Changed
+                client_count = len(self.server_object.get_clients())
+                print(f"    Connected clients: {client_count}")
+            except AttributeError:
+                print("    Connected clients: Error accessing client getter (is server object correct?).")
+            except Exception as e:
+                 print(f"    Connected clients: Error ({e})")
+            print("    Security: TLS Enabled (Verify server.py)")
+            print("              (No Client Authentication Handled by Shell)")
         else:
-            print("[+] Server is not running")
+            print("[+] Server Status: Stopped")
 
     def do_list_clients(self, args):
         """
-        List all connected clients with their addresses and connection details
+        List all connected clients with their addresses and connection details.
         Usage: list_clients
         """
-        if not self.server_running:
+        if not self.server_running or not self.server_object:
+            logging.warning("list_clients attempted while server not running.")
             print("[!] Server not running. Use start_server first.")
             return
 
-        if not self.server_object or not self.server_object.clients:
+        try:
+            # Use the safe getter method <<-- Changed
+            clients_data = self.server_object.get_clients()
+        except AttributeError:
+            print("[!] Error accessing server's client getter (is server object correct?).")
+            return
+        except Exception as e:
+             print(f"[!] Error getting client list: {e}")
+             return
+
+        if not clients_data:
             print("[!] No clients connected.")
             return
 
         print("\nConnected Clients:")
         print("==================")
-        for i, (address, client_socket) in enumerate(self.server_object.clients.items()):
-            # Check if this is the current client
-            current = " (current)" if self.current_client and self.current_client == client_socket else ""
+        i = 0
+        # clients_data is a copy, safe to iterate
+        for address, client_info in clients_data.items(): # <<-- Changed iteration
+            i += 1
+            # Unpack the tuple from the dictionary value <<-- Changed
+            client_socket, connection_time = client_info
 
-            # Get client IP and port
+            # Check if this is the current client using the stored address
+            current = " (current)" if self.current_client_address and self.current_client_address == address else ""
+
             ip, port = address
 
-            # Get socket details
+            # Get socket details (basic)
             try:
-                socket_family = socket.AF_INET if client_socket.family == socket.AF_INET else "Unknown"
-                socket_type = "TCP" if client_socket.type == socket.SOCK_STREAM else "UDP"
-                is_encrypted = "Yes" if hasattr(client_socket, 'context') else "No"
-            except:
-                socket_family = "Unknown"
-                socket_type = "Unknown"
+                socket_family_str = socket.AF_INET6 if client_socket.family == socket.AF_INET6 else socket.AF_INET
+                is_encrypted = "Yes (TLS)" # Server forces TLS
+            except AttributeError: # Socket might be closed or invalid
+                socket_family_str = "Unknown"
                 is_encrypted = "Unknown"
 
-            print(f"{i + 1}. Client: {ip}:{port}{current}")
-            print(f"   Connection: {socket_type} ({socket_family})")
-            print(f"   Encrypted: {is_encrypted}")
-            print(f"   Connected since: {time.strftime('%Y-%m-%d %H:%M:%S')}")
-            print()
+            # Format connection time from stored timestamp <<-- Changed
+            try:
+                connection_time_str = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(connection_time))
+            except:
+                connection_time_str = "Unknown"
 
-        # Print summary
-        print(f"Total clients: {len(self.server_object.clients)}")
+            print(f"{i}. Client: {ip}:{port}{current}")
+            print(f"   Address Family: {socket_family_str}")
+            print(f"   Encrypted: {is_encrypted}")
+            print(f"   Connected since: {connection_time_str}") #<<-- Corrected Time
+            print("-" * 18)
+
+        print(f"Total clients: {len(clients_data)}")
         print()
 
     def do_send_file(self, args):
         """
-        Send a file to the currently selected client or a specified client
-        Usage: send_file <file_path> [client_index]
-        Example: send_file /path/to/file.txt
-        Example: send_file /path/to/file.txt 1
+        Send a file using the server's send_file method.
+        Usage: send_file <local_file_path> [client_index]
+        Example: send_file /path/to/local/file.txt
+        Example: send_file C:\\Users\\Admin\\doc.txt 1
         """
-        if not self.server_running:
+        if not self.server_running or not self.server_object:
+            logging.warning("send_file attempted while server not running.")
             print("[!] Server not running. Use start_server first.")
             return
 
-        if not self.server_object or not self.server_object.clients:
+        try:
+            # Use getter for client data <<-- Changed
+            clients_data = self.server_object.get_clients()
+        except AttributeError:
+             print("[!] Error accessing server's client getter.")
+             return
+
+        if not clients_data:
             print("[!] No clients connected.")
             return
 
-        # Parse arguments
         try:
             args_list = shlex.split(args)
-
-            # Check if we have at least the file path
-            if len(args_list) < 1:
-                print("[!] Invalid arguments. Usage: send_file <file_path> [client_index]")
+            if not 1 <= len(args_list) <= 2:
+                print("[!] Usage: send_file <local_file_path> [client_index]")
                 return
 
-            file_path = args_list[0]
-            client_address = None
+            local_file_path = args_list[0]
+            target_client_address = None
 
-            # If client index is provided, use it
-            if len(args_list) == 2:
+            if len(args_list) == 2: # Client index provided
                 try:
                     client_index = int(args_list[1])
-                    if client_index < 1 or client_index > len(self.server_object.clients):
-                        print(f"[!] Invalid client index. Must be between 1 and {len(self.server_object.clients)}")
+                    if not 1 <= client_index <= len(clients_data):
+                        print(f"[!] Invalid client index. Must be between 1 and {len(clients_data)}")
                         return
-                    client_address = list(self.server_object.clients.keys())[client_index - 1]
+                    # Get address from index (safe as clients_data is a copy)
+                    target_client_address = list(clients_data.keys())[client_index - 1]
                 except ValueError:
-                    print("[!] Client index must be a number")
+                    print("[!] Client index must be a number.")
                     return
-            # Otherwise use the current client
-            else:
-                if not self.current_client:
+                except IndexError:
+                     print("[!] Client index out of range (client list might have changed). Try list_clients again.")
+                     return
+            else: # Use currently selected client
+                if not self.current_client_address:
                     print("[!] No client selected. Use select_client first or specify a client index.")
                     return
+                # Verify the selected client is still connected
+                if self.current_client_address not in clients_data:
+                     print("[!] Current client seems to have disconnected. Select another client.")
+                     self._clear_current_client()
+                     return
+                target_client_address = self.current_client_address
 
-                # Find the address for the current client socket
-                for address, socket in self.server_object.clients.items():
-                    if socket == self.current_client:
-                        client_address = address
-                        break
-
-                if not client_address:
-                    print("[!] Current client not found in active connections.")
-                    return
-
-            # Check if file exists
-            if not os.path.isfile(file_path):
-                print(f"[!] File not found: {file_path}")
+            if not os.path.isfile(local_file_path):
+                logging.error(f"File not found for sending: {local_file_path}")
+                print(f"[!] Local file not found: {local_file_path}")
                 return
 
-            print(f"[*] Sending file '{file_path}' to client {client_address}...")
+            target_ip, target_port = target_client_address
+            logging.info(f"Requesting server to send file '{local_file_path}' to client {target_ip}:{target_port}")
+            print(f"[*] Requesting server send file '{local_file_path}' to client {target_ip}:{target_port}...")
 
-            # Call the server's send_file method
-            self.server_object.send_file(file_path, client_address)
+            # Call the server's send_file method - API matches <<-- No change needed here
+            success = self.server_object.send_file(local_file_path, target_client_address)
+            # Check return value <<-- Added
+            if success:
+                 print(f"[+] Server reported file sent successfully to {target_ip}:{target_port}.")
+                 logging.info(f"Server call send_file succeeded for {local_file_path} to {target_ip}:{target_port}")
+            else:
+                 print(f"[!] Server reported failure to send file to {target_ip}:{target_port}. Check server logs.")
+                 logging.warning(f"Server call send_file failed for {local_file_path} to {target_ip}:{target_port}")
 
+        except (ValueError, IndexError, argparse.ArgumentError) as e:
+             logging.error(f"Argument error in send_file: {e}")
+             print(f"[!] Error processing arguments: {e}")
+        except AttributeError as e:
+             logging.error(f"Missing method/attribute on server object: {e}")
+             print(f"[!] Server object error: {e}. Is server.py correct?")
         except Exception as e:
+            logging.error(f"Error sending file: {e}", exc_info=True)
             print(f"[!] Error sending file: {e}")
 
     def do_cmd(self, args):
         """
-        Send a command to the currently selected client
-        Usage: send_command <command>
-        Example: send_command ls -la
+        Send a command for execution to the currently selected client.
+        Usage: cmd <command_and_args>
+        Example: cmd whoami
+        Example: cmd ls -la /tmp
         """
-        if not self.server_running:
+        # <<-- MAJOR CHANGES HERE -->>
+        if not self.server_running or not self.server_object:
+            logging.warning("cmd attempted while server not running.")
             print("[!] Server not running. Use start_server first.")
             return
 
-        if not self.server_object or not self.server_object.clients:
-            print("[!] No clients connected.")
-            return
-
-        if not self.current_client:
+        # Check if a client is selected (needs socket)
+        if not self.current_client_socket or not self.current_client_address:
             print("[!] No client selected. Use select_client first.")
             return
 
+        # Verify the selected client is still connected using getter
+        try:
+            clients_data = self.server_object.get_clients()
+            if self.current_client_address not in clients_data:
+                 print("[!] Current client seems to have disconnected. Select another client.")
+                 self._clear_current_client()
+                 return
+            # Refresh socket object just in case (though unlikely necessary with this server design)
+            self.current_client_socket = clients_data[self.current_client_address][0]
+        except AttributeError:
+            print("[!] Error accessing server's client getter for verification.")
+            return # Cannot verify, safer to stop
+
         if not args:
-            print("[!] No command provided. Usage: send_command <command>")
+            print("[!] No command provided. Usage: cmd <command_and_args>")
             return
 
+        ip, port = self.current_client_address
+        logging.info(f"Sending command directly to {ip}:{port}: {args}")
+        print(f"[*] Sending command to client {ip}:{port}: {args}")
+
         try:
-            # Find the address for the current client socket
-            client_address = None
-            for address, socket in self.server_object.clients.items():
-                if socket == self.current_client:
-                    client_address = address
-                    break
+            # Define prefix for single command execution (client needs to expect this)
+            command_to_send = f"EXEC {args}\n"
 
-            if not client_address:
-                print("[!] Current client not found in active connections.")
-                return
+            # Send directly using the stored socket
+            self.current_client_socket.sendall(command_to_send.encode('utf-8'))
 
-            ip, port = client_address
-            print(f"[*] Sending command '{args}' to client {ip}:{port}...")
+            # Receive the entire response using helper method
+            print("[*] Waiting for response...")
+            output_bytes = self._receive_all(self.current_client_socket, timeout=10.0) # 10 sec timeout
 
-            # Call the server's send_command method
-            self.server_object.send_command(args)
+            if output_bytes:
+                print("--- Client Output ---")
+                print(output_bytes.decode('utf-8', errors='replace').strip())
+                print("---------------------")
+                logging.info(f"Received response from {ip}:{port} for command '{args}'")
+            else:
+                # _receive_all returning empty usually means disconnect handled within it
+                # If it returns empty due to timeout with no data, log warning.
+                 if self.current_client_address: # Check if client wasn't cleared by _receive_all->handle_disconnection
+                    print("[!] No response received within timeout.")
+                    logging.warning(f"No response received from {ip}:{port} for command '{args}'")
 
+
+        except ConnectionResetError:
+             # Error already handled by _receive_all or _handle_disconnection
+             logging.warning(f"Connection reset during cmd execution for {ip}:{port}.")
+        except (socket.error, ssl.SSLError, BrokenPipeError) as e:
+            print(f"[!] Connection error with client {ip}:{port}: {e}")
+            logging.error(f"Socket error during cmd for {ip}:{port}: {e}", exc_info=True)
+            self._handle_disconnection(self.current_client_address)
         except Exception as e:
-            print(f"[!] Error sending command: {e}")
+            print(f"[!] Unexpected error sending/receiving command: {e}")
+            logging.error(f"Unexpected error in do_cmd for {ip}:{port}: {e}", exc_info=True)
+            # Consider disconnecting on unexpected errors too
+            if self.current_client_address:
+                 self._handle_disconnection(self.current_client_address)
 
+    # Renamed from do_use
     def do_select_client(self, args):
         """
-        Select a client for interaction
+        Select a client for interaction by its index. Stores selection locally.
         Usage: select_client <client_index>
         Example: select_client 1
         """
-        if not self.server_running:
+        # <<-- Changed -->>
+        if not self.server_running or not self.server_object:
+            logging.warning("select_client attempted while server not running.")
             print("[!] Server not running. Use start_server first.")
             return
 
-        if not self.server_object or not self.server_object.clients:
+        try:
+            # Use getter <<-- Changed
+            clients_data = self.server_object.get_clients()
+        except AttributeError:
+             print("[!] Error accessing server's client getter.")
+             return
+
+        if not clients_data:
             print("[!] No clients connected.")
             return
 
         try:
-            # Parse the client index
             if not args:
                 print("[!] No client index provided. Usage: select_client <client_index>")
                 return
 
             try:
                 client_index = int(args)
-                if client_index < 1 or client_index > len(self.server_object.clients):
-                    print(f"[!] Invalid client index. Must be between 1 and {len(self.server_object.clients)}")
+                if not 1 <= client_index <= len(clients_data):
+                    print(f"[!] Invalid client index. Must be between 1 and {len(clients_data)}")
                     return
             except ValueError:
-                print("[!] Client index must be a number")
+                print("[!] Client index must be a number.")
                 return
+            except IndexError: # Should be caught by length check, but good practice
+                 print("[!] Client index calculation error.")
+                 return
 
-            # Get the client address and socket from the index
-            client_address = list(self.server_object.clients.keys())[client_index - 1]
-            client_socket = self.server_object.clients[client_address]
+            # Get address from index
+            target_address = list(clients_data.keys())[client_index - 1]
+            # Unpack tuple to get socket and timestamp <<-- Changed
+            target_socket, _ = clients_data[target_address]
 
-            # Set the current client
-            self.current_client = client_socket
+            # Store selection locally <<-- Changed
+            self.current_client_socket = target_socket
+            self.current_client_address = target_address
 
-            # Also update the server's current client for consistency
-            self.server_object.switch_connection(client_address)
+            # Remove call to non-existent switch_connection <<-- Changed
+            # self.server_object.switch_connection(target_address)
 
-            ip, port = client_address
+            ip, port = target_address
+            logging.info(f"Selected client {ip}:{port} (Index {client_index})")
             print(f"[+] Selected client: {ip}:{port}")
+            # Update prompt
+            self.prompt = f'AceLock ({ip}:{port})> '
 
+        except (ValueError, IndexError, argparse.ArgumentError) as e:
+             logging.error(f"Argument error in select_client: {e}")
+             print(f"[!] Error processing arguments: {e}")
+        except AttributeError as e:
+             logging.error(f"Missing method/attribute on server object: {e}")
+             print(f"[!] Server object error: {e}. Is server.py correct?")
         except Exception as e:
+            logging.error(f"Error selecting client: {e}", exc_info=True)
             print(f"[!] Error selecting client: {e}")
+            self._clear_current_client()
+
 
     def do_disconnect_client(self, args):
         """
-        Forcibly disconnect a specific client
+        Forcibly disconnect a specific client by its index using the server's method.
         Usage: disconnect_client <client_index>
         Example: disconnect_client 1
         """
-        if not self.server_running:
+        # <<-- Changed -->>
+        if not self.server_running or not self.server_object:
+            logging.warning("disconnect_client attempted while server not running.")
             print("[!] Server not running. Use start_server first.")
             return
 
-        if not self.server_object or not self.server_object.clients:
+        try:
+             # Use getter <<-- Changed
+             clients_data = self.server_object.get_clients()
+        except AttributeError:
+            print("[!] Error accessing server's client getter.")
+            return
+
+        if not clients_data:
             print("[!] No clients connected.")
             return
 
         try:
-            # Parse the client index
             if not args:
                 print("[!] No client index provided. Usage: disconnect_client <client_index>")
                 return
 
             try:
                 client_index = int(args)
-                if client_index < 1 or client_index > len(self.server_object.clients):
-                    print(f"[!] Invalid client index. Must be between 1 and {len(self.server_object.clients)}")
+                if not 1 <= client_index <= len(clients_data):
+                    print(f"[!] Invalid client index. Must be between 1 and {len(clients_data)}")
                     return
             except ValueError:
                 print("[!] Client index must be a number")
                 return
+            except IndexError:
+                 print("[!] Client index calculation error.")
+                 return
 
-            # Get the client address and socket from the index
-            client_address = list(self.server_object.clients.keys())[client_index - 1]
-            client_socket = self.server_object.clients[client_address]
+            # Get address from index
+            target_address = list(clients_data.keys())[client_index - 1]
+            ip, port = target_address
 
-            # Check if this is the current client
-            if self.current_client and self.current_client == client_socket:
-                self.current_client = None
-                print("[*] Current client selection cleared")
+            # Use the server's safe disconnect method <<-- Changed
+            logging.info(f"Requesting server to disconnect client {ip}:{port} (Index {client_index})")
+            print(f"[*] Requesting server disconnect client: {ip}:{port}...")
+            disconnected = self.server_object.disconnect_client(target_address)
 
-            # Close the client socket
-            ip, port = client_address
-            print(f"[*] Disconnecting client: {ip}:{port}...")
+            if disconnected:
+                print(f"[+] Server reported client {ip}:{port} disconnected.")
+                logging.info(f"Client {ip}:{port} disconnected via server method.")
+                # Check if this was the currently selected client
+                if self.current_client_address == target_address:
+                    print("[*] Current client selection cleared.")
+                    self._clear_current_client() # Use helper
+            else:
+                 print(f"[!] Server failed to disconnect client {ip}:{port} (may already be disconnected).")
+                 logging.warning(f"Server call disconnect_client failed for {ip}:{port}")
 
-            try:
-                client_socket.close()
-                print(f"[+] Client {ip}:{port} disconnected")
-            except Exception as e:
-                print(f"[!] Error closing client socket: {e}")
-
-            # Remove the client from the server's clients dictionary
-            if client_address in self.server_object.clients:
-                del self.server_object.clients[client_address]
-                print(f"[+] Client {ip}:{port} removed from active connections")
-
+        except (ValueError, IndexError, argparse.ArgumentError) as e:
+             logging.error(f"Argument error in disconnect_client: {e}")
+             print(f"[!] Error processing arguments: {e}")
+        except AttributeError as e:
+             logging.error(f"Missing disconnect_client method on server object: {e}")
+             print(f"[!] Server object error: {e}. Is server.py correct?")
         except Exception as e:
+            logging.error(f"Error disconnecting client: {e}", exc_info=True)
             print(f"[!] Error disconnecting client: {e}")
+
 
     def do_stop_server(self, args):
         """
-        Stop the server
+        Stop the server using its stop() method.
         Usage: stop_server
         """
-        if not self.server_running:
-            print("[!] Server is not running")
-            return
+        # <<-- No major change needed, already calls server's stop() -->>
+        with self._lock:
+            if not self.server_running:
+                logging.warning("stop_server attempted while server not running.")
+                print("[!] Server is not running.")
+                return
 
         try:
+            logging.info("Stopping server via command...")
             print("[*] Stopping server...")
-            self.server_object.stop()
+            if self.server_object:
+                self.server_object.stop() # Uses the server's stop method
+                logging.info("Server object stop() method called.")
 
+            # State update handled by _run_server finally block, but set here for responsiveness
             with self._lock:
                 self.server_running = False
 
-            print("[+] Server stopped")
+            print("[+] Server stop request processed.")
+            self._clear_current_client() # Clear selection
 
-            # Reset client connection if server is stopped
-            self.current_client = None
+        except AttributeError as e:
+             logging.error(f"Missing stop method on server object: {e}")
+             print(f"[!] Server object error: {e}. Is server.py correct?")
         except Exception as e:
+            logging.error(f"Error stopping server: {e}", exc_info=True)
             print(f"[!] Error stopping server: {e}")
+            with self._lock: # Ensure state is False on error too
+                 self.server_running = False
+            self._clear_current_client()
+
+
+    def do_shell_mode(self, args):
+        """
+        Enter interactive shell mode with the selected client via DIRECT socket access.
+        Type 'exit' or 'quit' within the shell to return here.
+        Usage: shell_mode
+        """
+        # <<-- MAJOR CHANGES HERE (similar to do_cmd) -->>
+        if not self.server_running or not self.server_object:
+            logging.warning("shell_mode attempted while server not running.")
+            print("[!] Server not running. Use start_server first.")
+            return
+
+        if not self.current_client_socket or not self.current_client_address:
+            print("[!] No client selected. Use select_client first.")
+            return
+
+        # Verify the selected client is still connected using getter
+        try:
+            clients_data = self.server_object.get_clients()
+            if self.current_client_address not in clients_data:
+                 print("[!] Current client seems to have disconnected. Select another client.")
+                 self._clear_current_client()
+                 return
+            # Refresh socket object
+            self.current_client_socket = clients_data[self.current_client_address][0]
+        except AttributeError:
+            print("[!] Error accessing server's client getter for verification.")
+            return
+
+        ip, port = self.current_client_address
+        logging.info(f"Entering direct shell mode with client {ip}:{port}")
+        print(f"[*] Entering interactive shell with {ip}:{port}...")
+        print("[*] Type 'exit' or 'quit' to return to AceLock shell.")
+
+        original_prompt = self.prompt
+        shell_prompt = f"{ip}:{port}> "
+
+        try:
+            # Send SHELL_START command to client to initiate shell mode <<-- Added
+            try:
+                start_cmd = "SHELL_START\n"
+                self.current_client_socket.sendall(start_cmd.encode('utf-8'))
+                logging.info(f"Sent SHELL_START to {ip}:{port}")
+            except (socket.error, ssl.SSLError, BrokenPipeError) as e:
+                 print(f"[!] Failed to send SHELL_START indicator: {e}")
+                 logging.error(f"Socket error sending SHELL_START to {ip}:{port}: {e}")
+                 self._handle_disconnection(self.current_client_address)
+                 return # Cannot start shell mode
+
+            while True: # Main loop for sending/receiving shell data
+                try:
+                    shell_input = input(shell_prompt)
+
+                    if not shell_input.strip(): continue
+
+                    if shell_input.lower() in ["exit", "quit"]:
+                        logging.info(f"Exiting shell mode for {ip}:{port} by user command.")
+                        # Send exit command to client (client's shell_session handles Popen exit)
+                        try:
+                             # Send exactly what user typed + newline
+                             self.current_client_socket.sendall((shell_input + "\n").encode('utf-8'))
+                             sleep(0.1) # Give client a moment
+                        except (socket.error, ssl.SSLError, BrokenPipeError) as sock_err:
+                             logging.warning(f"Socket error sending 'exit' to {ip}:{port}: {sock_err}. Assuming disconnect.")
+                             self._handle_disconnection(self.current_client_address)
+                        print("[+] Exiting shell mode.")
+                        break # Exit the shell_mode loop
+
+                    # Send the command directly via the socket + newline
+                    self.current_client_socket.sendall((shell_input + "\n").encode('utf-8'))
+
+                    # Receive and display output using helper
+                    # Use a shorter timeout? Or rely on client sending promptly.
+                    output = self._receive_all(self.current_client_socket, timeout=1.0) # Shorter timeout for interactive feel
+                    if output:
+                         print(output.decode('utf-8', errors='replace'), end='')
+                         if not output.endswith(b'\n') and not output.endswith(b'\r'):
+                              print() # Ensure prompt on new line
+                    # else: timeout is expected if command gives no immediate output
+
+                except KeyboardInterrupt:
+                    print("\n[!] Interrupt received. Sending newline (Ctrl+C). Type 'exit' or 'quit' to leave.")
+                    try:
+                        self.current_client_socket.sendall(b'\n')
+                    except (socket.error, ssl.SSLError, BrokenPipeError) as sock_err:
+                         logging.warning(f"Socket error sending newline on interrupt: {sock_err}")
+                         self._handle_disconnection(self.current_client_address)
+                         break
+                    continue
+
+                except ConnectionResetError:
+                     # Handled by _receive_all or _handle_disconnection called within it
+                     logging.warning(f"Connection reset during shell mode for {ip}:{port}.")
+                     break # Exit shell mode loop
+                except (socket.error, ssl.SSLError, BrokenPipeError) as e:
+                    print(f"\n[!] Connection error with client {ip}:{port}: {e}")
+                    logging.error(f"Socket error during shell mode with {ip}:{port}: {e}", exc_info=True)
+                    self._handle_disconnection(self.current_client_address)
+                    break
+                except Exception as e: # Catch unexpected errors in loop
+                     print(f"\n[!] Unexpected error in shell input/output loop: {e}")
+                     logging.error(f"Unexpected error in shell loop for {ip}:{port}: {e}", exc_info=True)
+                     self._handle_disconnection(self.current_client_address)
+                     break
+
+        except Exception as e: # Catch errors during initial SHELL_START send
+            print(f"[!] Unexpected error initiating shell mode: {e}")
+            logging.error(f"Unexpected error initiating shell_mode for {ip}:{port}: {e}", exc_info=True)
+            if self.current_client_address:
+                 self._handle_disconnection(self.current_client_address)
+        finally:
+            self.prompt = original_prompt # Restore prompt
+            logging.info(f"Exited shell mode routine for {ip}:{port}")
+
 
     def do_exit(self, args):
         """
-        Stop the server and exit the command shell
-        Usage: stop
+        Stop the server (if running) and exit the command shell.
+        Usage: exit | quit | EOF
         """
+        print("[*] Exiting AceLock...")
+        logging.info("Exit command received.")
         if self.server_running:
-            self.do_stop_server(args)
-        print("[+] Exiting AceLock command shell...")
-        return True  # Return True to exit the cmd loop
+             self.do_stop_server(args)
+        return True  # Exit cmd loop
+
+    # --- Helper Methods (Keep from previous refined version) ---
+
+    def _receive_all(self, sock, timeout=2.0):
+        """Helper to receive data from a socket until timeout or close."""
+        if not sock or sock._closed: # Check if socket is closed
+             logging.warning("_receive_all called with closed or invalid socket.")
+             if self.current_client_address: # If we know which client it was
+                 self._handle_disconnection(self.current_client_address)
+             return b''
+        if not isinstance(sock, socket.socket):
+             logging.error("_receive_all called with non-socket object.")
+             return b''
+
+        sock.settimeout(timeout)
+        total_data = b''
+        try:
+            while True:
+                chunk = sock.recv(4096)
+                if chunk:
+                    total_data += chunk
+                else:
+                    # Socket closed gracefully by peer
+                    logging.info(f"Socket recv returned empty, peer {sock.getpeername() if not sock._closed else '(closed)'} likely closed connection.")
+                    raise ConnectionResetError("Peer closed connection")
+        except socket.timeout:
+            logging.debug(f"Socket timeout after receiving {len(total_data)} bytes.")
+            pass # Expected behavior when no more data arrives
+        except ConnectionResetError as e:
+             logging.warning(f"ConnectionResetError during _receive_all: {e}")
+             if self.current_client_address: self._handle_disconnection(self.current_client_address)
+             raise # Re-raise so caller knows connection is gone
+        except (socket.error, ssl.SSLError, OSError) as e:
+             # Check for specific "closed" errors vs other errors
+             if sock._closed or "closed" in str(e).lower() or "broken pipe" in str(e).lower():
+                  logging.warning(f"Socket error indicates closed connection during _receive_all: {e}")
+                  if self.current_client_address: self._handle_disconnection(self.current_client_address)
+                  raise ConnectionResetError(f"Socket closed: {e}") # Treat as disconnect
+             else:
+                  logging.error(f"Socket error during _receive_all: {e}")
+                  if self.current_client_address: self._handle_disconnection(self.current_client_address)
+                  raise ConnectionResetError(f"Socket error likely indicates disconnect: {e}")
+        finally:
+            try:
+                 if not sock._closed: sock.settimeout(None) # Reset only if still open
+            except (socket.error, OSError): pass
+        return total_data
+
+    def _clear_current_client(self):
+        """Clears the current client selection and resets the prompt."""
+        if self.current_client_address or self.current_client_socket:
+            self.current_client_socket = None
+            self.current_client_address = None
+            self.prompt = 'AceLock> '
+            logging.info("Current client selection cleared.")
+
+    def _handle_disconnection(self, client_address):
+        """Handles cleaning up state when a client disconnects or errors occur."""
+        if not client_address: return
+
+        ip, port = client_address
+        print(f"\n[*] Handling apparent disconnection for client {ip}:{port}.")
+        logging.warning(f"Handling disconnection/error for {ip}:{port}")
+
+        # Attempt removal via the server's safe method <<-- Changed
+        if self.server_object:
+            logging.info(f"Requesting server disconnect client {ip}:{port} due to error/disconnect.")
+            self.server_object.disconnect_client(client_address) # Server handles actual close/removal
+
+        # Clear selection if this was the current client
+        if self.current_client_address == client_address:
+            self._clear_current_client()
 
 
+    # --- Command Aliases ---
+    do_quit = do_exit
+    do_EOF = do_exit # Handle Ctrl+D
+
+# ============================================================================
+
+if __name__ == '__main__':
+    # Optional: Basic check for default cert/key paths at start
+    default_cert = '../ssl_deets/server.crt'
+    default_key = '../ssl_deets/server.key'
+    if not os.path.isfile(default_cert) or not os.path.isfile(default_key):
+         print(f"[!] Warning: Default SSL certificate ({default_cert}) or key ({default_key}) not found.", file=sys.stderr)
+         print("[!] Server start may fail unless paths are specified via: start_server -cert /path/to/cert -key /path/to/key", file=sys.stderr)
+
+    try:
+        shell = CommandShell(certfile=default_cert, keyfile=default_key)
+        shell.cmdloop()
+    except KeyboardInterrupt:
+        print("\n[*] Exiting AceLock Shell via KeyboardInterrupt.")
+        logging.info("Shell terminated by KeyboardInterrupt.")
+    except ImportError as import_err:
+         logging.critical(f"Failed to import required server components: {import_err}", exc_info=True)
+         print(f"\n[!] Critical Error: Could not load server code from server.py: {import_err}", file=sys.stderr)
+         sys.exit(1)
+    except Exception as main_e:
+        logging.critical(f"Unhandled exception in main execution: {main_e}", exc_info=True)
+        print(f"\n[!] Critical error: {main_e}", file=sys.stderr)
+        sys.exit(1)

