@@ -939,29 +939,3 @@ class Client:
             # Try to send fatal error back to server
             self.send_message(err_msg)
 
-# --- Example Usage ---
-if __name__ == "__main__":
-    SERVER_HOST = "127.0.0.1"  # Server IP or hostname
-    SERVER_PORT = 8000         # Server Port
-    # Optional: Path to server.crt or CA cert bundle for verification
-    # CERT_FILE = '../ssl_deets/server.crt'
-
-    client_instance = Client(SERVER_HOST, SERVER_PORT)
-    main_thread = threading.current_thread()
-    main_thread.name = "ClientMainThread"
-
-    try:
-        # Start the client in the main thread. It will block until connection ends.
-        client_instance.start_client()
-    except KeyboardInterrupt:
-        client_logger.info("Keyboard interrupt received. Stopping client...")
-        # stop_client() will be called by the finally block in start_client
-    except Exception as e:
-         client_logger.critical(f"Unhandled exception in main execution block: {e}", exc_info=True)
-    finally:
-         # Ensure stop is called if start_client returns or raises non-KeyboardInterrupt
-         if client_instance.running:
-              client_logger.info("Ensuring client is stopped in main finally block...")
-              client_instance.stop_client()
-
-    client_logger.info("Client program finished.")
