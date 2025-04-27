@@ -5,17 +5,10 @@ import os
 import time
 import logging
 
-# --- Basic Logging Setup ---
+# --- Logging Setup ---
 # Configure logging for the server module
 log_format = '%(asctime)s - %(threadName)s - %(levelname)s - %(message)s'
 logging.basicConfig(level=logging.INFO, format=log_format)
-# You might want to direct server logs to a different file than the shell
-# handler = logging.FileHandler("server.log")
-# handler.setFormatter(logging.Formatter(log_format))
-# server_logger = logging.getLogger(__name__)
-# server_logger.addHandler(handler)
-# server_logger.propagate = False # Prevent double logging if root logger also has handlers
-# Use standard logging for simplicity here:
 server_logger = logging.getLogger()
 
 
@@ -23,9 +16,7 @@ class TCPServer:
     """
     A thread-safe TLS-enabled TCP server designed for C2 operations.
     Handles client connections, provides mechanisms for listing clients,
-    sending files, and disconnecting clients safely. Interaction logic
-    (command sending/receiving) is expected to be handled by the controller
-    (e.g., CommandShell) using the client sockets retrieved via get_clients().
+    sending files, and disconnecting clients safely.
     """
     def __init__(self, host="0.0.0.0", port=8000, certfile='server.crt', keyfile='server.key'):
         """
@@ -49,9 +40,6 @@ class TCPServer:
         # Event to signal the server's main loop to stop gracefully
         self._stop_event = threading.Event()
 
-        # --- SECURITY WARNING ---
-        server_logger.warning("TCPServer initialized WITHOUT client authentication (e.g., mutual TLS).")
-        server_logger.warning("Ensure client authentication is implemented if required for security.")
         # --- END SECURITY WARNING ---
 
     def start(self, started_event):
@@ -336,22 +324,8 @@ class TCPServer:
 
         server_logger.info(f"Server stop sequence complete. Closed {disconnected_count}/{len(client_addresses)} client connections.")
 
-    # --- Deprecated/Removed Methods ---
-    # These methods are removed as they relied on internal state ('current_client')
-    # and had problematic implementations (e.g., recv in send). The CommandShell
-    # should interact directly with client sockets obtained via get_clients().
 
-    # def switch_connection(self, target_address):
-    #     raise NotImplementedError("switch_connection is deprecated. Use get_clients() and interact directly.")
-
-    # def send_command(self, command):
-    #     raise NotImplementedError("send_command is deprecated. Use get_clients() and interact directly.")
-
-    # def receive_command(self, buffer_size=1024):
-    #     raise NotImplementedError("receive_command is deprecated. Use get_clients() and interact directly.")
-
-
-# Example of how the CommandShell would start this server (simplified)
+# Start Server
 if __name__ == '__main__':
     print("This script provides the TCPServer class.")
     print("It should be imported and managed by a controller script (like CommandShell).")

