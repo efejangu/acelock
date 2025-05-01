@@ -211,7 +211,6 @@ class CommandShell(cmd.Cmd):
                 print("[!] Current client seems to have disconnected. Select another client.")
                 self._clear_current_client()
                 return False
-            # Refresh socket object just in case (unlikely necessary but safe)
             self.current_client_socket = clients_data[self.current_client_address][0]
             return True
         except AttributeError:
@@ -281,7 +280,7 @@ class CommandShell(cmd.Cmd):
             # Unpack the tuple from the dictionary value <<-- Changed
             client_socket, connection_time = client_info
 
-            # Check if this is the current client using the stored address
+
             current = " (current)" if self.current_client_address and self.current_client_address == address else ""
 
             ip, port = address

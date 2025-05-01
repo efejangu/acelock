@@ -50,10 +50,7 @@ class TCPServer:
         Args:
             started_event (threading.Event): An event object that will be set
                                              when the server is ready to accept connections.
-        Raises:
-            ssl.SSLError: If certificate/key loading fails.
-            OSError: If binding/listening fails.
-            Exception: For other unexpected errors during startup.
+
         """
         server_logger.info(f"Initializing secure server on {self.host}:{self.port}...")
         try:

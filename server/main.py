@@ -1,10 +1,8 @@
 from command_shell import CommandShell
 import os
-import logging
 
 
 if __name__ == '__main__':
-    # Optional: Basic check for default cert/key paths at start
     default_cert = '../ssl_deets/server.crt'
     default_key = '../ssl_deets/server.key'
     if not os.path.isfile(default_cert) or not os.path.isfile(default_key):

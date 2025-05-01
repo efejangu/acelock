@@ -919,7 +919,7 @@ class Client:
                       self.send_message(f"STATUS: ({i+1}/{len(target_files)}) {message}\n")
 
 
-            # Final Report
+
             end_time = time.time()
             duration = end_time - start_time
             final_msg = f"COMPLETED: {mode.capitalize()} finished in {duration:.2f}s. " \
