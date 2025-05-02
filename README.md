@@ -38,7 +38,7 @@ pip install -r requirements.txt
 
 The command shell allows you to interact with the server and connected clients. Below are the available commands:
 
-- **Start the Server**: `start_server [-host HOST] [-port PORT] [-cert CERTFILE] [-key KEYFILE]`
+- **Start the Server**: `start_server [-host HOST] [-port PORT] [-cert CERTFILE]`
 - **Check Server Status**: `server_status`
 - **List Connected Clients**: `list_clients`
 - **Send File**: `send_file <local_file_path> [client_index]`
